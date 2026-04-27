@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# netdoc — ネットワークドクター
+#   ゲストネット（DMG MORI 等）に繋いだ後 Claude が動かない時に走らせる。
+#   診断 → 原因切り分け → 修復メニュー（DNSキャッシュ／DHCP更新／captive portal／Tailscale／Wi-Fi リセット）。
+#
+# 使い方:
+#   netdoc            対話モード（推奨）
+#   netdoc --auto     安全な修復を全部自動で実行
+#   netdoc --check    診断のみ（修復しない）
+
+set -uo pipefail
+
+MODE="interactive"
+case "${1:-}" in
+  --auto)  MODE="auto" ;;
+  --check) MODE="check" ;;
+  -h|--help)
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
+esac
+
+# ─── 装飾 ────────────────────────────────────────────────
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'; BLU=$'\033[34m'
+  DIM=$'\033[2m'; BLD=$'\033[1m'; RST=$'\033[0m'
+else
+  RED=''; GRN=''; YLW=''; BLU=''; DIM=''; BLD=''; RST=''
+fi
+ok()   { printf "  ${GRN}✓${RST} %s\n" "$*"; }
+ng()   { printf "  ${RED}✗${RST} %s\n" "$*"; }
+warn() { printf "  ${YLW}!${RST} %s\n" "$*"; }
+info() { printf "  ${BLU}ℹ${RST} %s\n" "$*"; }
+step() { printf "\n${BLD}▶ %s${RST}\n" "$*"; }
+hr()   { printf "${DIM}────────────────────────────────────────────${RST}\n"; }
+
+ask() {
+  # ask "質問" [Y|N(default)]
+  local q="$1" def="${2:-N}" ans
+  [ "$MODE" = "auto" ] && { [ "$def" = "Y" ]; return $?; }
+  [ "$MODE" = "check" ] && return 1
+  if [ "$def" = "Y" ]; then
+    read -r -p "$(printf "  ${YLW}?${RST} %s ${DIM}[Y/n]${RST} " "$q")" ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy] ]]
+  else
+    read -r -p "$(printf "  ${YLW}?${RST} %s ${DIM}[y/N]${RST} " "$q")" ans
+    [[ "$ans" =~ ^[Yy] ]]
+  fi
+}
+
+# ─── ヘッダ ──────────────────────────────────────────────
+clear 2>/dev/null || true
+printf "${BLD}🩺 netdoc${RST}  ${DIM}— ネットワーク診断＆修復${RST}\n"
+printf "${DIM}%s  mode=%s${RST}\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$MODE"
+hr
+
+# ─── 1. 現状把握 ─────────────────────────────────────────
+step "1. 現在のネットワーク状況"
+
+DEFIF=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+DEFGW=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
+if [ -n "$DEFIF" ]; then
+  ok  "デフォルトIF : ${BLD}$DEFIF${RST}  (gw $DEFGW)"
+else
+  ng  "デフォルトルート無し — ケーブル/Wi-Fi の物理接続を確認"
+fi
+
+WIFIIF=$(networksetup -listallhardwareports 2>/dev/null \
+         | awk '/Hardware Port: Wi-Fi/{getline; print $2}')
+WIFIIF=${WIFIIF:-en0}
+
+if [ -n "$DEFIF" ]; then
+  IP=$(ipconfig getifaddr "$DEFIF" 2>/dev/null)
+  [ -n "$IP" ] && ok "IPv4         : $IP" || warn "IPv4 未取得"
+fi
+
+SSID=$(networksetup -getairportnetwork "$WIFIIF" 2>/dev/null \
+       | sed 's/^Current Wi-Fi Network: //')
+if [ -n "$SSID" ] && ! echo "$SSID" | grep -qi 'not associated'; then
+  ok "Wi-Fi SSID   : ${BLD}$SSID${RST}"
+fi
+
+DNS_LIST=$(scutil --dns 2>/dev/null \
+           | awk '/nameserver\[/{print $3}' | sort -u | head -3 | paste -sd, -)
+[ -n "$DNS_LIST" ] && info "DNS          : $DNS_LIST" || warn "DNS 未設定"
+
+TS_BIN="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+TS_STATE=""
+if [ -x "$TS_BIN" ]; then
+  TS_STATE=$("$TS_BIN" status --json 2>/dev/null \
+             | grep -o '"BackendState":"[^"]*"' | head -1 \
+             | sed 's/.*:"//;s/"$//')
+  [ -n "$TS_STATE" ] && info "Tailscale    : $TS_STATE"
+fi
+
+# ─── 2. 接続テスト ───────────────────────────────────────
+step "2. 接続テスト"
+
+PROBLEMS=0
+NO_DNS=0
+NO_ICMP=0
+NO_HTTPS=0
+CAPTIVE=0
+
+# DNS
+for h in api.anthropic.com github.com www.google.com; do
+  if [ -n "$(dig +short +time=2 +tries=1 "$h" 2>/dev/null)" ]; then
+    ok "DNS解決      : $h"
+  else
+    ng "DNS解決失敗  : $h"
+    NO_DNS=1; PROBLEMS=$((PROBLEMS+1))
+  fi
+done
+
+# ICMP
+if ping -c 2 -t 3 1.1.1.1 >/dev/null 2>&1; then
+  ok "ping 1.1.1.1 : 到達"
+else
+  ng "ping 1.1.1.1 : 失敗（ゲストネットがICMPを止めてる可能性も）"
+  NO_ICMP=1; PROBLEMS=$((PROBLEMS+1))
+fi
+
+# HTTPS to Anthropic
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 https://api.anthropic.com/ 2>/dev/null)
+if [[ "$HTTP_CODE" =~ ^[2-4] ]]; then
+  ok "HTTPS api.anthropic.com : OK (HTTP $HTTP_CODE)"
+else
+  ng "HTTPS api.anthropic.com : 到達不可 ${DIM}(これがClaude Codeの不調原因)${RST}"
+  NO_HTTPS=1; PROBLEMS=$((PROBLEMS+1))
+fi
+
+# Captive portal
+CAP_BODY=$(curl -sL --max-time 4 http://captive.apple.com/ 2>/dev/null | tr -d '\r\n')
+if echo "$CAP_BODY" | grep -q '<TITLE>Success</TITLE>'; then
+  ok "Captive portal : なし（直結）"
+else
+  warn "Captive portal の可能性あり — ブラウザでログインが必要かも"
+  CAPTIVE=1; PROBLEMS=$((PROBLEMS+1))
+fi
+
+hr
+if [ $PROBLEMS -eq 0 ]; then
+  printf "${GRN}${BLD}✓ 問題なし。Claudeも動くはずです。${RST}\n"
+  exit 0
+fi
+printf "${YLW}${BLD}△ ${PROBLEMS} 件の問題を検出${RST}\n"
+
+[ "$MODE" = "check" ] && { info "(--check モードなので修復はスキップ)"; exit 1; }
+
+# ─── 3. 修復メニュー ─────────────────────────────────────
+step "3. 修復オプション ${DIM}（上から順に試すのがおすすめ）${RST}"
+
+# 3-0 Captive最優先
+if [ $CAPTIVE -eq 1 ]; then
+  if ask "[0] captive portal をブラウザで開く（ログインが必要なネット用）" Y; then
+    open "http://captive.apple.com/" 2>/dev/null
+    info "ブラウザでログインを完了したら Enter を押してください"
+    [ "$MODE" = "interactive" ] && read -r
+    ok "Captive portal 操作完了"
+  fi
+fi
+
+# 3-1 DNSキャッシュ
+if ask "[1] DNSキャッシュをクリア ${DIM}(sudo必要)${RST}" Y; then
+  if sudo -n true 2>/dev/null || sudo true; then
+    sudo dscacheutil -flushcache
+    sudo killall -HUP mDNSResponder
+    ok "DNSキャッシュをクリアしました"
+  else
+    warn "sudo 認証失敗 — スキップ"
+  fi
+fi
+
+# 3-2 DHCPリース更新
+if [ -n "$DEFIF" ] && ask "[2] DHCPリースを更新（IPアドレスを取り直す）" Y; then
+  if sudo -n true 2>/dev/null || sudo true; then
+    sudo ipconfig set "$DEFIF" BOOTP 2>/dev/null
+    sleep 1
+    sudo ipconfig set "$DEFIF" DHCP 2>/dev/null
+    sleep 3
+    NEWIP=$(ipconfig getifaddr "$DEFIF" 2>/dev/null)
+    [ -n "$NEWIP" ] && ok "新IP: $NEWIP" || warn "IP取得待ち（数秒〜十数秒かかることあり）"
+  else
+    warn "sudo 認証失敗 — スキップ"
+  fi
+fi
+
+# 3-3 Tailscale再接続
+if [ -x "$TS_BIN" ] && [ "$TS_STATE" = "Running" ]; then
+  if ask "[3] Tailscale を一旦切断（ゲストネットがVPNを嫌う場合）" N; then
+    "$TS_BIN" down
+    ok "Tailscale down — 必要になったら 'tailscale up' or アプリから再接続"
+  fi
+elif [ -x "$TS_BIN" ]; then
+  if ask "[3] Tailscale を再接続" N; then
+    "$TS_BIN" up && ok "Tailscale up"
+  fi
+fi
+
+# 3-4 Wi-Fi電源 OFF/ON
+if ask "[4] Wi-Fi 電源を OFF→ON して再接続" N; then
+  networksetup -setairportpower "$WIFIIF" off
+  sleep 3
+  networksetup -setairportpower "$WIFIIF" on
+  sleep 5
+  NEWIP=$(ipconfig getifaddr "$WIFIIF" 2>/dev/null)
+  ok "Wi-Fi 再起動完了（IP: ${NEWIP:-取得中}）"
+fi
+
+# 3-5 MTU調整（経験則：corporate guest は 1400 で安定することが多い）
+if [ -n "$DEFIF" ] && ask "[5] MTU を 1400 に下げる ${DIM}(captive portal越しでHTTPSが固まる時)${RST}" N; then
+  CUR_MTU=$(ifconfig "$DEFIF" 2>/dev/null | awk '/mtu/{for(i=1;i<=NF;i++)if($i=="mtu"){print $(i+1);exit}}')
+  info "現在のMTU: $CUR_MTU → 1400 に変更"
+  sudo ifconfig "$DEFIF" mtu 1400 && ok "MTU=1400 に変更（戻す: sudo ifconfig $DEFIF mtu ${CUR_MTU:-1500}）"
+fi
+
+# ─── 4. 再テスト ─────────────────────────────────────────
+step "4. 修復後の再テスト"
+sleep 2
+
+RECHECK=0
+if [ -n "$(dig +short +time=2 +tries=1 api.anthropic.com 2>/dev/null)" ]; then
+  ok "DNS解決 api.anthropic.com OK"
+else
+  ng "DNS解決まだダメ"; RECHECK=1
+fi
+
+HTTP_CODE2=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 https://api.anthropic.com/ 2>/dev/null)
+if [[ "$HTTP_CODE2" =~ ^[2-4] ]]; then
+  ok "HTTPS api.anthropic.com OK (HTTP $HTTP_CODE2)"
+else
+  ng "HTTPS api.anthropic.com まだ繋がらない"; RECHECK=1
+fi
+
+hr
+if [ $RECHECK -eq 0 ]; then
+  printf "${GRN}${BLD}✓ 復活しました。Claude Code を起動どうぞ。${RST}\n"
+  exit 0
+fi
+
+printf "${RED}${BLD}✗ まだ繋がりません。${RST}\n\n"
+info "次に試すこと:"
+info "  ・もう一度ブラウザで http://captive.apple.com/ を開いてログイン状態確認"
+info "  ・ゲストネットが api.anthropic.com / *.anthropic.com を握りつぶしてる可能性"
+info "    → iPhone のテザリングに切り替えるのが最速"
+info "  ・MTU をさらに下げる: sudo ifconfig $DEFIF mtu 1300"
+info "  ・proxy 環境変数の混入確認: env | grep -i proxy"
+exit 1
