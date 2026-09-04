@@ -98,7 +98,7 @@ captive portal の有無、`ANTHROPIC_API_KEY` が環境変数に入っていな
 ```
 ▶ 4. 所見
   いちばんありそうな原因
-    ollama @spark-703f はモデルを読み込んでいない
+    ollama @gpubox はモデルを読み込んでいない
     → 初回の応答に数秒〜数十秒かかります。常駐させるなら OLLAMA_KEEP_ALIVE=-1
 
   ほかに見えているもの
@@ -117,10 +117,10 @@ netdoc --stream
 
 ```
 ▶ ストリーミングの初動 （実際に生成させます）
-  ✓ ollama (ローカル)  : 初トークンまで 0.04秒   ochiai-v27style
+  ✓ ollama (ローカル)  : 初トークンまで 0.04秒   my-model:8b
   ! ollama @studio     : 初トークンまで 11.85秒  starcoder2:15b
     冷えた状態からの読み込み。常駐させるなら OLLAMA_KEEP_ALIVE=-1
-  ! ollama @spark      : 初トークンまで 16.21秒  gemma3:4b
+  ! ollama @gpubox    : 初トークンまで 16.21秒  gemma3:4b
 ```
 
 `--stream` は実際にモデルを起こすので明示指定のときだけ動きます。通常の診断では
