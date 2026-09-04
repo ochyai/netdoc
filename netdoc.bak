@@ -1,0 +1,865 @@
+#!/usr/bin/env bash
+# netdoc — ネットワークドクター
+#
+#   「LLM に繋がらない」ときに、どこで死んでいるかを段階で切り分けて直す。
+#   DNS → TCP → TLS → HTTP を分けて測るので、原因が名前解決なのか、
+#   ポート塞ぎなのか、TLS 傍受なのか、認証なのかが一目で分かる。
+#
+# 使い方:
+#   netdoc                 対話モード（診断 → 修復メニュー）
+#   netdoc --check         診断のみ。何もいじらない
+#   netdoc --auto          安全な修復を自動で実行
+#   netdoc --llm           LLM への疎通だけを段階で調べる
+#   netdoc --speed         回線速度・遅延・MTU だけ測る
+#   netdoc --where         いまどこに居るか（IP・ISP・Wi-Fi・経路）だけ
+#   netdoc --json          全結果を JSON で出す（機械可読）
+#   netdoc --report [PATH] Markdown レポートを書き出す
+#   netdoc --watch [SEC]   定期監視。状態が変わったときだけ表示
+#   netdoc --targets       調べに行く先の一覧（~/.netdoc/targets.conf）
+#   netdoc --discover      tailnet と手元から LLM サーバを探して登録する
+#   netdoc --restore-dns   固定したDNSを元に戻す
+#
+# bash 3.2 (macOS標準) で動く。外部依存なし（jq があれば JSON が整形される）。
+
+set -uo pipefail
+
+VERSION="0.2.0"
+MODE="interactive"
+REPORT_PATH=""
+WATCH_SEC=60
+
+case "${1:-}" in
+  --auto)    MODE="auto" ;;
+  --check)   MODE="check" ;;
+  --llm)     MODE="llm" ;;
+  --speed)   MODE="speed" ;;
+  --where)   MODE="where" ;;
+  --json)    MODE="json" ;;
+  --targets) MODE="targets" ;;
+  --report)  MODE="report"; REPORT_PATH="${2:-$HOME/netdoc-$(date +%Y%m%d-%H%M%S).md}" ;;
+  --watch)   MODE="watch"; WATCH_SEC="${2:-60}" ;;
+  --restore-dns) MODE="restore-dns" ;;
+  --discover)    MODE="discover" ;;
+  -v|--version) echo "netdoc $VERSION"; exit 0 ;;
+  -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  "") ;;
+  *) echo "不明なオプション: $1  （netdoc --help）" >&2; exit 2 ;;
+esac
+
+# ─── 装飾 ────────────────────────────────────────────────
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "$MODE" != "json" ]; then
+  RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'; BLU=$'\033[34m'
+  CYA=$'\033[36m'; DIM=$'\033[2m'; BLD=$'\033[1m'; RST=$'\033[0m'
+else
+  RED=''; GRN=''; YLW=''; BLU=''; CYA=''; DIM=''; BLD=''; RST=''
+fi
+Q="$MODE"; [ "$Q" = "json" ] && exec 3>&1 1>/dev/null || exec 3>/dev/null
+ok()   { printf "  ${GRN}✓${RST} %s\n" "$*"; }
+ng()   { printf "  ${RED}✗${RST} %s\n" "$*"; }
+warn() { printf "  ${YLW}!${RST} %s\n" "$*"; }
+info() { printf "  ${BLU}ℹ${RST} %s\n" "$*"; }
+note() { printf "    ${DIM}%s${RST}\n" "$*"; }
+step() { printf "\n${BLD}▶ %s${RST}\n" "$*"; }
+hr()   { printf "${DIM}────────────────────────────────────────────────────────${RST}\n"; }
+
+ask() {
+  local q="$1" def="${2:-N}" ans
+  [ "$MODE" = "auto" ] && { [ "$def" = "Y" ]; return $?; }
+  case "$MODE" in check|llm|speed|where|json|report|watch|targets) return 1 ;; esac
+  if [ "$def" = "Y" ]; then
+    read -r -p "$(printf "  ${YLW}?${RST} %s ${DIM}[Y/n]${RST} " "$q")" ans
+    [ -z "$ans" ] || echo "$ans" | grep -qi '^y'
+  else
+    read -r -p "$(printf "  ${YLW}?${RST} %s ${DIM}[y/N]${RST} " "$q")" ans
+    echo "$ans" | grep -qi '^y'
+  fi
+}
+
+# ─── 結果の記録（bash3.2に連想配列が無いのでTSVに貯める）──────
+FACTS="$(mktemp -t netdoc.facts)"
+FIND="$(mktemp -t netdoc.find)"     # 所見（原因の候補）
+trap 'rm -f "$FACTS" "$FIND"' EXIT
+fact()   { printf '%s\t%s\n' "$1" "$2" >>"$FACTS"; }   # key<TAB>value
+getf()   { awk -F'\t' -v k="$1" '$1==k{print $2; exit}' "$FACTS"; }
+finding(){ printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$FIND"; }  # 深刻度 タイトル 対処
+
+NOW="$(date '+%Y-%m-%d %H:%M:%S')"
+fact ts "$NOW"; fact version "$VERSION"
+
+# ─── 設定（調べに行く先）──────────────────────────────────
+CONF_DIR="$HOME/.netdoc"
+TARGETS="$CONF_DIR/targets.conf"
+seed_targets() {
+  mkdir -p "$CONF_DIR"
+  {
+    echo "# netdoc が疎通を調べに行く先。1行1件。"
+    echo "# 形式: 名前 | URL | 種別(http|ollama|openai|tcp)"
+    echo "# 種別 ollama なら /api/tags を読んでモデル数まで確認する。"
+    echo "# 種別 openai なら /v1/models を読む（persona-node もこれ）。"
+    echo "# ここに自分の LLM サーバを足すと、まとめて面倒を見る。"
+    echo
+    echo "Anthropic API      | https://api.anthropic.com/          | http"
+    echo "claude.ai          | https://claude.ai/                  | http"
+    echo "ollama (ローカル)   | http://127.0.0.1:11434             | ollama"
+    # 手元で動いていそうなものを初回に拾っておく
+    if curl -s -o /dev/null --max-time 2 http://127.0.0.1:8787/healthz 2>/dev/null; then
+      echo "persona-node       | http://127.0.0.1:8787              | openai"
+    fi
+    echo
+    echo "# tailnet 上のLLMサーバは  netdoc --discover  で探して追記できます。"
+  } >"$TARGETS"
+}
+tailscale_ips() { :; }   # 後で本体を定義する（seed時は空でよい）
+
+# ─── 小道具 ──────────────────────────────────────────────
+TS_BIN=""
+for c in "$(command -v tailscale 2>/dev/null)" \
+         "/Applications/Tailscale.app/Contents/MacOS/Tailscale" \
+         "/usr/local/bin/tailscale" "/opt/homebrew/bin/tailscale"; do
+  [ -n "$c" ] && [ -x "$c" ] && { TS_BIN="$c"; break; }
+done
+
+msec() { # 秒(小数) → ミリ秒(整数)
+  awk -v s="${1:-0}" 'BEGIN{printf "%d", s*1000}'
+}
+mbps() { # bytes/sec → Mbps(小数1桁)
+  awk -v b="${1:-0}" 'BEGIN{printf "%.1f", b*8/1000000}'
+}
+dwidth() { # 表示幅。全角=2桁。
+  # case の文字クラスは UTF-8 ロケールで期待通りに効かないので、
+  # 「バイト数と文字数の差」から出す（3バイト文字1つにつき差が2）。
+  local str="$1" chars bytes
+  chars=${#str}
+  bytes=$(printf '%s' "$str" | LC_ALL=C wc -c | tr -d ' ')
+  echo $(( chars + (bytes - chars) / 2 ))
+}
+
+human_bytes() {
+  awk -v b="${1:-0}" 'BEGIN{
+    if(b>1073741824) printf "%.1fGB", b/1073741824;
+    else if(b>1048576) printf "%.1fMB", b/1048576;
+    else if(b>1024) printf "%.0fKB", b/1024; else printf "%dB", b}'
+}
+
+# ─── 1. いまどこに居るか ─────────────────────────────────
+tailscale_peers() {
+  # "IP<TAB>ホスト名" を1行ずつ。--json は整形出力なので plain を使う。
+  [ -n "$TS_BIN" ] || return 0
+  "$TS_BIN" status 2>/dev/null \
+    | awk '$1 ~ /^100\./ && $0 !~ /offline/ {printf "%s\t%s\n", $1, $2}'
+}
+tailscale_ips() { tailscale_peers | cut -f1; }
+
+section_where() {
+  step "1. いまどこに居るか"
+
+  DEFIF=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+  DEFGW=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
+  fact default_if "$DEFIF"; fact gateway "$DEFGW"
+  if [ -n "$DEFIF" ]; then
+    ok "経路          : ${BLD}$DEFIF${RST} → gw $DEFGW"
+  else
+    ng "デフォルトルートが無い — ケーブル/Wi-Fi の物理接続から"
+    finding critical "デフォルトルートが無い" "ケーブルを挿し直すか Wi-Fi に接続する"
+  fi
+
+  # 生きているインターフェースを全部
+  ACTIVE=""
+  for i in $(ifconfig -l 2>/dev/null); do
+    case "$i" in lo0|gif*|stf*|awdl*|llw*|bridge*|ap1) continue ;; esac
+    a=$(ipconfig getifaddr "$i" 2>/dev/null)
+    [ -z "$a" ] && continue
+    mark=" "; [ "$i" = "$DEFIF" ] && mark="*"
+    svc=$(networksetup -listnetworkserviceorder 2>/dev/null \
+          | awk -v d="Device: $i)" 'index($0,d){print prev} {if($0 ~ /^\([0-9]/) prev=substr($0,index($0,") ")+2)}' | head -1)
+    ACTIVE="$ACTIVE$i:$a "
+    printf "  %s %-8s %-16s ${DIM}%s${RST}\n" "$mark" "$i" "$a" "${svc:-}"
+  done
+  fact interfaces "$ACTIVE"
+  note "* が現在の経路"
+
+  # Wi-Fi の質（電波が細いと LLM のストリーミングが途切れる）
+  WIFI=$(system_profiler SPAirPortDataType 2>/dev/null \
+         | sed -n '/Current Network Information/,/^$/p')
+  if [ -n "$WIFI" ]; then
+    SSID=$(echo "$WIFI" | awk 'NR==2{gsub(/^ +| *:$/,""); print}')
+    SIG=$(echo "$WIFI"  | awk -F': ' '/Signal \/ Noise/{print $2}')
+    CH=$(echo "$WIFI"   | awk -F': ' '/Channel:/{print $2}')
+    RATE=$(echo "$WIFI" | awk -F': ' '/Transmit Rate/{print $2}')
+    PHY=$(echo "$WIFI"  | awk -F': ' '/PHY Mode/{print $2}')
+    [ -n "$SSID" ] && ok "Wi-Fi         : ${BLD}$SSID${RST}  ${DIM}$PHY ch$CH  $SIG  ${RATE}Mbps${RST}"
+    fact wifi_ssid "$SSID"; fact wifi_signal "$SIG"; fact wifi_rate "$RATE"
+    RSSI=$(echo "$SIG" | awk '{print $1}' | tr -d '-')
+    if [ -n "$RSSI" ] && [ "$RSSI" -gt 75 ] 2>/dev/null; then
+      warn "電波が弱い（RSSI -${RSSI}dBm）— 途切れやすい"
+      finding warn "Wi-Fiの電波が弱い (-${RSSI}dBm)" "AP に近づくか有線/テザリングへ"
+    fi
+  fi
+
+  # DNS
+  DNS_LIST=$(scutil --dns 2>/dev/null | awk '/nameserver\[/{print $3}' | sort -u | head -4 | paste -sd, -)
+  fact dns "$DNS_LIST"
+  [ -n "$DNS_LIST" ] && info "DNS           : $DNS_LIST" || {
+    warn "DNS サーバが設定されていない"
+    finding critical "DNS未設定" "DHCPを更新するか DNS を 1.1.1.1 に手動設定"
+  }
+
+  # グローバル IP と出口（Cloudflare の trace。余計な情報は送らない）
+  TRACE=$(curl -s --max-time 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+  if [ -n "$TRACE" ]; then
+    GIP=$(echo "$TRACE"  | awk -F= '/^ip=/{print $2}')
+    GLOC=$(echo "$TRACE" | awk -F= '/^loc=/{print $2}')
+    COLO=$(echo "$TRACE" | awk -F= '/^colo=/{print $2}')
+    WARP=$(echo "$TRACE" | awk -F= '/^warp=/{print $2}')
+    fact global_ip "$GIP"; fact colo "$COLO"; fact loc "$GLOC"
+    ok "グローバルIP  : ${BLD}$GIP${RST}  ${DIM}$GLOC / 出口 $COLO${RST}"
+    [ "$WARP" = "on" ] && info "Cloudflare WARP が有効"
+  else
+    warn "グローバルIPを取れない（外へ出られていない可能性）"
+  fi
+
+  # Tailscale
+  if [ -n "$TS_BIN" ]; then
+    TSJ=$("$TS_BIN" status --json 2>/dev/null)
+    # tailscale の --json は整形出力なので "key": "value" と空白が入る。
+    TS_STATE=$(echo "$TSJ" | sed -n 's/.*"BackendState"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    TS_IP=$(tailscale_ips | head -1)
+    fact tailscale_state "$TS_STATE"; fact tailscale_ip "$TS_IP"
+    if [ "$TS_STATE" = "Running" ]; then
+      NPEER=$("$TS_BIN" status 2>/dev/null | grep -c '^100\.')
+      NDIRECT=$("$TS_BIN" status 2>/dev/null | grep -c 'direct ')
+      NRELAY=$("$TS_BIN" status 2>/dev/null | grep -c 'relay ')
+      ok "Tailscale     : $TS_IP  ${DIM}peers ${NPEER}（直結 $NDIRECT / 中継 ${NRELAY}）${RST}"
+      if [ "$NRELAY" -gt 0 ] && [ "$NRELAY" -ge "$NDIRECT" ]; then
+        warn "多くのピアが DERP 中継。tailnet 越しの転送が細くなる"
+        finding warn "Tailscaleが中継経由" "UDP 41641 が塞がれている可能性。可能なら別網へ"
+      fi
+      EXIT_NODE=$("$TS_BIN" status 2>/dev/null | awk '/exit node/{print $2}' | head -1)
+      [ -n "$EXIT_NODE" ] && { info "exit node 経由: $EXIT_NODE"; fact exit_node "$EXIT_NODE"; }
+    else
+      info "Tailscale     : ${TS_STATE:-停止}"
+      if [ -f "$TARGETS" ] && grep -qE 'http://100\.[0-9]' "$TARGETS"; then
+        warn "tailnet 上のLLMを見に行く設定なのに Tailscale が止まっている"
+        finding critical "Tailscaleが停止中" "tailscale up（tailnet先のLLMには到達できません）"
+      fi
+    fi
+  fi
+
+  # プロキシと環境変数（LLM が繋がらない原因の常連）
+  PROXY_ENV=$(env | grep -iE '^(http|https|all|no)_proxy=' | paste -sd' ' -)
+  SYS_PROXY=$(scutil --proxy 2>/dev/null | awk '/HTTPEnable|HTTPSEnable/{print $3}' | grep -c '^1$')
+  fact proxy_env "$PROXY_ENV"
+  if [ -n "$PROXY_ENV" ]; then
+    warn "プロキシ環境変数がある: ${DIM}$PROXY_ENV${RST}"
+    finding warn "proxy 環境変数が効いている" "外して再試行: env -u HTTP_PROXY -u HTTPS_PROXY ..."
+  fi
+  [ "${SYS_PROXY:-0}" -gt 0 ] 2>/dev/null && {
+    warn "システム設定にプロキシが入っている（scutil --proxy）"
+    finding warn "システムプロキシ有効" "設定 > ネットワーク > 詳細 > プロキシ を確認"
+  }
+
+  # 時計のずれ（数分ずれると TLS が落ちる）
+  RDATE=$(curl -sI --max-time 6 https://www.cloudflare.com/ 2>/dev/null | awk -F': ' 'tolower($1)=="date"{print $2}' | tr -d '\r')
+  if [ -n "$RDATE" ]; then
+    RS=$(LC_ALL=C date -j -u -f "%a, %d %b %Y %H:%M:%S GMT" "$RDATE" "+%s" 2>/dev/null)
+    if [ -n "$RS" ]; then
+      SKEW=$(( $(date -u +%s) - RS )); [ "$SKEW" -lt 0 ] && SKEW=$(( -SKEW ))
+      fact clock_skew "$SKEW"
+      if [ "$SKEW" -gt 120 ]; then
+        ng "時計が ${SKEW}秒 ずれている — TLS が失敗する原因"
+        finding critical "時計が${SKEW}秒ずれている" "sudo sntp -sS time.apple.com で合わせる"
+      else
+        ok "時刻          : ずれ ${SKEW}秒"
+      fi
+    fi
+  fi
+}
+
+# ─── 2. 回線の質 ─────────────────────────────────────────
+probe_mtu() {
+  # 通る最大パケットを二分探索で実測する。1400 を決め打ちしない。
+  local host="${1:-1.1.1.1}" lo=1200 hi=1500 mid pay
+  ping -c1 -t2 -D -s $((hi-28)) "$host" >/dev/null 2>&1 && { echo "$hi"; return; }
+  ping -c1 -t2 -D -s $((lo-28)) "$host" >/dev/null 2>&1 || { echo ""; return; }
+  while [ $((hi-lo)) -gt 4 ]; do
+    mid=$(( (lo+hi)/2 )); pay=$((mid-28))
+    if ping -c1 -t2 -D -s "$pay" "$host" >/dev/null 2>&1; then lo=$mid; else hi=$mid; fi
+  done
+  echo "$lo"
+}
+
+section_quality() {
+  step "2. 回線の質"
+
+  # 遅延・ジッタ・ロス
+  for target in "${DEFGW:-}" 1.1.1.1; do
+    [ -z "$target" ] && continue
+    P=$(ping -c 6 -i 0.3 -t 4 "$target" 2>/dev/null)
+    LOSS=$(echo "$P" | awk -F'[,%]' '/packet loss/{gsub(/ /,"",$3); print $3+0}')
+    STATS=$(echo "$P" | awk -F'[/= ]+' '/round-trip|rtt/{print $(NF-3)" "$(NF-1)}')
+    AVG=$(echo "$STATS" | awk '{printf "%.1f", $1}')
+    JIT=$(echo "$STATS" | awk '{printf "%.1f", $2}')
+    label="ゲートウェイ"; [ "$target" = "1.1.1.1" ] && label="インターネット"
+    if [ -z "$AVG" ] || [ "$AVG" = "0.0" ]; then
+      ng "$label ($target) : 応答なし"
+      [ "$target" = "1.1.1.1" ] && finding warn "ICMPが通らない" "ゲストネットがpingを止めているだけの場合もある"
+    else
+      msg="$label ($target) : ${AVG}ms  ${DIM}ジッタ ${JIT}ms / ロス ${LOSS:-0}%${RST}"
+      if [ "${LOSS:-0}" -gt 5 ] 2>/dev/null; then
+        warn "$msg"
+        finding warn "パケットロス ${LOSS}%" "電波かAP混雑。有線かテザリングへ"
+      else ok "$msg"; fi
+    fi
+    if [ "$target" = "1.1.1.1" ]; then
+      if [ -z "$AVG" ] || [ "$AVG" = "0.0" ]; then
+        fact rtt "n/a(ICMP遮断)"; fact jitter "n/a"; fact loss "n/a"
+      else
+        fact rtt "$AVG"; fact jitter "$JIT"; fact loss "${LOSS:-0}"
+      fi
+    fi
+  done
+
+  # DNS 解決にかかる時間
+  T0=$(date +%s%N 2>/dev/null || echo 0)
+  dig +short +time=3 +tries=1 api.anthropic.com >/dev/null 2>&1
+  T1=$(date +%s%N 2>/dev/null || echo 0)
+  if [ "$T0" != "0" ]; then
+    DNSMS=$(( (T1-T0)/1000000 )); fact dns_ms "$DNSMS"
+    if [ "$DNSMS" -gt 500 ]; then
+      warn "DNS解決     : ${DNSMS}ms（遅い）"
+      finding warn "DNSが遅い(${DNSMS}ms)" "DNSを1.1.1.1に固定すると改善することが多い"
+    else ok "DNS解決     : ${DNSMS}ms"; fi
+  fi
+
+  # MTU の実測
+  MTU_SCOPE=""
+  MTU_IF=$(ifconfig "${DEFIF:-en0}" 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="mtu"){print $(i+1);exit}}')
+  MTU_REAL=$(probe_mtu 1.1.1.1)
+  # 外向き ICMP が塞がれている網は珍しくない。ゲートウェイまでで測り直す。
+  [ -z "$MTU_REAL" ] && [ -n "${DEFGW:-}" ] && MTU_REAL=$(probe_mtu "$DEFGW") && MTU_SCOPE="（ゲートウェイまで）"
+  fact mtu_if "$MTU_IF"; fact mtu_real "$MTU_REAL"
+  if [ -n "$MTU_REAL" ]; then
+    if [ "$MTU_REAL" -lt "${MTU_IF:-1500}" ] 2>/dev/null; then
+      warn "MTU         : 設定 ${MTU_IF} だが 実際に通るのは ${MTU_REAL}"
+      note "大きなパケットが黙って捨てられる＝HTTPSが途中で固まる典型"
+      finding critical "MTU不整合 (設定${MTU_IF} / 実測${MTU_REAL})" "sudo ifconfig ${DEFIF} mtu ${MTU_REAL}"
+    else
+      ok "MTU         : ${MTU_IF}（実測 ${MTU_REAL} まで通る${MTU_SCOPE:-}）"
+    fi
+  else
+    info "MTU         : 実測できず（ICMPが塞がれている）"
+  fi
+
+  # スループット
+  if [ "$MODE" = "speed" ] || [ "$MODE" = "interactive" ] || [ "$MODE" = "auto" ] || [ "$MODE" = "report" ] || [ "$MODE" = "json" ]; then
+    printf "  ${DIM}速度を測っています…${RST}\r"
+    DL=$(curl -o /dev/null -s -w '%{speed_download}' --max-time 20 \
+         'https://speed.cloudflare.com/__down?bytes=25000000' 2>/dev/null)
+    UL=$(dd if=/dev/zero bs=1m count=8 2>/dev/null | curl -o /dev/null -s -w '%{speed_upload}' \
+         --max-time 20 -X POST --data-binary @- 'https://speed.cloudflare.com/__up' 2>/dev/null)
+    DLM=$(mbps "${DL:-0}"); ULM=$(mbps "${UL:-0}")
+    fact down_mbps "$DLM"; fact up_mbps "$ULM"
+    printf "                                        \r"
+    LINE="下り ${BLD}${DLM}${RST} Mbps / 上り ${BLD}${ULM}${RST} Mbps"
+    if awk -v d="$DLM" 'BEGIN{exit !(d<5)}'; then
+      warn "速度        : $LINE ${DIM}— 細い${RST}"
+      finding warn "回線が細い (下り ${DLM}Mbps)" "大きなモデルの応答が詰まる。テザリング等を検討"
+    else
+      ok "速度        : $LINE"
+    fi
+  fi
+
+  # tailnet 越しの実効速度（自分のLLMサーバが向こうにある場合に効く）
+  if [ -n "$TS_BIN" ] && [ "$(getf tailscale_state)" = "Running" ]; then
+    PEER=$("$TS_BIN" status 2>/dev/null | awk '$1 ~ /^100\./ && $NF !~ /offline/ {print $1; exit}')
+    if [ -n "$PEER" ]; then
+      TP=$(ping -c 4 -i 0.3 -t 3 "$PEER" 2>/dev/null | awk -F'[/= ]+' '/round-trip|rtt/{printf "%.1f", $(NF-3)}')
+      [ -n "$TP" ] && info "tailnet     : $PEER まで ${TP}ms"
+    fi
+  fi
+}
+
+# ─── 3. LLM に届くか（段階で切り分ける）──────────────────
+PUBLIC_CA='Let.s Encrypt|DigiCert|GlobalSign|Amazon|Google Trust|Sectigo|ISRG|Baltimore|USERTrust|GTS |Cloudflare Inc'
+
+url_host() { echo "$1" | sed -E 's#^[a-z]+://##; s#/.*$##; s#:[0-9]+$##'; }
+url_port() {
+  local u="$1" h; h=$(echo "$u" | sed -E 's#^[a-z]+://##; s#/.*$##')
+  case "$h" in *:*) echo "${h##*:}" ;;
+  *) case "$u" in https://*) echo 443 ;; *) echo 80 ;; esac ;; esac
+}
+
+probe_target() {
+  # probe_target "表示名" "URL" "種別"
+  local name="$1" url="$2" kind="$3"
+  local host port scheme
+  host=$(url_host "$url"); port=$(url_port "$url")
+  case "$url" in https://*) scheme=https ;; *) scheme=http ;; esac
+
+  local stage_dns="-" stage_tcp="-" stage_tls="-" stage_http="-" extra="" bad=0
+
+  # DNS
+  if echo "$host" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$|^localhost$'; then
+    stage_dns="不要"
+  else
+    local a1 a2
+    a1=$(dig +short +time=3 +tries=1 "$host" 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+    if [ -n "$a1" ]; then
+      stage_dns="$a1"
+      a2=$(dig +short +time=3 +tries=1 @1.1.1.1 "$host" 2>/dev/null | grep -E '^[0-9]+\.' | head -3)
+      if [ -n "$a2" ] && ! echo "$a2" | grep -q "^$a1$"; then
+        # 権威と違う答えが返っている＝DNSを書き換えられている疑い
+        if echo "$host" | grep -qvE '\.local$'; then
+          extra="${extra}DNS応答が公開DNSと不一致 "
+          finding critical "DNSが書き換えられている疑い ($host)" "DNSを1.1.1.1に固定して再試行"
+        fi
+      fi
+    else
+      stage_dns="✗"; bad=1
+      finding critical "名前解決できない ($host)" "DNSキャッシュ消去→DHCP更新→DNSを1.1.1.1に固定"
+    fi
+  fi
+
+  # TCP
+  if [ "$bad" -eq 0 ]; then
+    if nc -z -G 4 -w 4 "$host" "$port" >/dev/null 2>&1; then
+      stage_tcp="開"
+    else
+      stage_tcp="✗"; bad=1
+      case "$host" in
+        127.0.0.1|localhost) finding critical "ローカルの $port が閉じている ($name)" "そのサーバが起動しているか確認" ;;
+        100.*) finding critical "tailnet先の $host:$port に繋がらない ($name)" "相手機の起動と listen アドレス(0.0.0.0)を確認" ;;
+        *) finding critical "$host:$port が塞がれている" "ファイアウォール/ゲストネットのポート制限。テザリングで確認" ;;
+      esac
+    fi
+  fi
+
+  # TLS
+  if [ "$bad" -eq 0 ] && [ "$scheme" = https ]; then
+    local out issuer verify
+    out=$(echo | openssl s_client -connect "$host:$port" -servername "$host" \
+          -verify_return_error 2>&1 | head -60)
+    issuer=$(echo "$out" | sed -n 's/^issuer=//p' | head -1)
+    [ -z "$issuer" ] && issuer=$(echo "$out" | sed -n 's/.*issuer: //p' | head -1)
+    verify=$(echo "$out" | sed -n 's/^ *Verify return code: //p' | head -1)
+    if echo "$out" | grep -q "CONNECTED" && [ -n "$issuer" ]; then
+      stage_tls="OK"
+      if ! echo "$issuer" | grep -qE "$PUBLIC_CA"; then
+        stage_tls="傍受?"
+        extra="${extra}証明書の発行者=${issuer} "
+        finding critical "TLSが傍受されている ($host)" \
+          "企業/ゲスト網の中間装置。社内CAを信頼するか、テザリングに切替"
+      fi
+    else
+      stage_tls="✗"; bad=1
+      finding critical "TLSハンドシェイク失敗 ($host)" "時計のずれ、SNIブロック、中間装置を疑う"
+    fi
+  fi
+
+  # HTTP（種別ごとに「生きているか分かる場所」を叩く）
+  if [ "$bad" -eq 0 ]; then
+    local w code ttot probe_url="$url"
+    case "$kind" in
+      ollama) probe_url="$url/api/tags" ;;
+      openai) curl -s -o /dev/null --max-time 4 "$url/healthz" 2>/dev/null \
+                && probe_url="$url/healthz" || probe_url="$url/v1/models" ;;
+    esac
+    w=$(curl -s -o /dev/null --max-time 12 -w '%{http_code} %{time_total}' "$probe_url" 2>/dev/null)
+    code=$(echo "$w" | awk '{print $1}'); ttot=$(echo "$w" | awk '{print $2}')
+    stage_http="$code $(msec "$ttot")ms"
+    case "$code" in
+      000) stage_http="✗"; bad=1
+           finding critical "HTTPが返らない ($host)" "TLSは通るのに応答が無い＝中間装置が握り潰している疑い" ;;
+      407) bad=1; finding critical "プロキシ認証を要求されている ($host)" "社内プロキシの資格情報が必要" ;;
+      5*)  finding warn "サーバ側が $code を返す ($host)" "相手側の問題。時間をおいて再試行" ;;
+      401) extra="${extra}要認証(サーバは生きている) " ;;
+      403) extra="${extra}403(APIルートでは正常なことが多い) " ;;
+      404) extra="${extra}404(APIルートでは正常) " ;;
+    esac
+  fi
+
+  # 種別ごとの中身の確認
+  if [ "$bad" -eq 0 ]; then
+    case "$kind" in
+      ollama)
+        local tags n
+        tags=$(curl -s --max-time 8 "$url/api/tags" 2>/dev/null)
+        n=$(echo "$tags" | grep -o '"name"' | wc -l | tr -d ' ')
+        if [ "${n:-0}" -gt 0 ]; then extra="${extra}モデル${n}本 "
+        else extra="${extra}応答はするがモデル一覧が読めない "; fi ;;
+      openai)
+        local m n
+        m=$(curl -s --max-time 8 "$url/v1/models" 2>/dev/null)
+        n=$(echo "$m" | grep -o '"id"' | wc -l | tr -d ' ')
+        [ "${n:-0}" -gt 0 ] && extra="${extra}モデル${n}本 " ;;
+    esac
+  fi
+
+  # 表示
+  local sym="${GRN}✓${RST}"; [ "$bad" -eq 1 ] && sym="${RED}✗${RST}"
+  echo "$extra" | grep -q '傍受\|不一致' && sym="${YLW}!${RST}"
+  printf "  %s %s" "$sym" "$name"
+  local _w; _w=$(dwidth "$name")
+  while [ "$_w" -lt 22 ]; do printf ' '; _w=$((_w+1)); done
+  printf "${DIM}DNS${RST} %-16s ${DIM}TCP${RST} %-4s ${DIM}TLS${RST} %-7s ${DIM}HTTP${RST} %-11s ${DIM}%s${RST}\n" \
+    "$stage_dns" "$stage_tcp" "$stage_tls" "$stage_http" "$extra"
+  fact "target_$name" "$stage_dns|$stage_tcp|$stage_tls|$stage_http|$extra"
+  return $bad
+}
+
+section_llm() {
+  step "3. LLM に届くか ${DIM}（DNS → TCP → TLS → HTTP のどこで死ぬか）${RST}"
+  [ -f "$TARGETS" ] || seed_targets
+
+  LLM_BAD=0
+  while IFS='|' read -r name url kind; do
+    name=$(echo "$name" | sed 's/^ *//; s/ *$//')
+    url=$(echo "$url"   | sed 's/^ *//; s/ *$//')
+    kind=$(echo "$kind" | sed 's/^ *//; s/ *$//')
+    case "$name" in ''|\#*) continue ;; esac
+    [ -z "$url" ] && continue
+    probe_target "$name" "$url" "${kind:-http}" || LLM_BAD=$((LLM_BAD+1))
+  done <"$TARGETS"
+  fact llm_bad "$LLM_BAD"
+
+  # captive portal
+  CAP=$(curl -sL --max-time 5 http://captive.apple.com/ 2>/dev/null | tr -d '\r\n')
+  if echo "$CAP" | grep -q '<TITLE>Success</TITLE>'; then
+    ok "captive portal      : なし（直結）"
+    fact captive no
+  else
+    warn "captive portal      : ログインが必要な可能性"
+    fact captive yes
+    finding critical "captive portal 未通過" "ブラウザで http://captive.apple.com/ を開いてログイン"
+  fi
+
+  # 「繋がらない」の正体が認証だった、を切り分ける
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    warn "ANTHROPIC_API_KEY が環境変数に入っている"
+    note "これがサブスクのOAuthより優先され、古い/失効した鍵だと 401 になる"
+    note "回線ではなく認証の問題。外して試す: unset ANTHROPIC_API_KEY"
+    finding warn "ANTHROPIC_API_KEY が設定されている" "unset して再試行（401は回線問題ではない）"
+  fi
+  for f in "$HOME/.claude/.credentials.json" "$HOME/.config/claude/auth.env"; do
+    [ -f "$f" ] && info "認証情報            : $(basename "$f") あり ${DIM}(中身は見ていない)${RST}"
+  done
+}
+
+# ─── 4. 所見 ─────────────────────────────────────────────
+section_verdict() {
+  step "4. 所見"
+  if [ ! -s "$FIND" ]; then
+    printf "  ${GRN}${BLD}問題なし。LLM は動くはずです。${RST}\n"
+    return 0
+  fi
+  NCRIT=$(awk -F'\t' '$1=="critical"' "$FIND" | wc -l | tr -d ' ')
+  NWARN=$(awk -F'\t' '$1=="warn"' "$FIND" | wc -l | tr -d ' ')
+  fact critical_count "$NCRIT"; fact warn_count "$NWARN"
+  while IFS=$'\t' read -r sev title fix; do
+    if [ "$sev" = critical ]; then printf "  ${RED}●${RST} ${BLD}%s${RST}\n" "$title"
+    else printf "  ${YLW}●${RST} %s\n" "$title"; fi
+    printf "    ${DIM}→ %s${RST}\n" "$fix"
+  done <"$FIND"
+  return 1
+}
+
+# ─── 5. 修復 ─────────────────────────────────────────────
+DNS_BACKUP="$CONF_DIR/dns.backup"
+
+section_repair() {
+  step "5. 修復 ${DIM}（上から順に試すのがおすすめ）${RST}"
+  SVC=$(networksetup -listnetworkserviceorder 2>/dev/null \
+        | awk -v d="Device: ${DEFIF:-en0})" 'index($0,d){print prev} {if($0 ~ /^\([0-9]/) prev=substr($0,index($0,") ")+2)}' | head -1)
+
+  if [ "$(getf captive)" = yes ]; then
+    ask "[0] captive portal をブラウザで開く" Y && {
+      open "http://captive.apple.com/" 2>/dev/null
+      info "ログインを済ませたら Enter"; [ "$MODE" = interactive ] && read -r
+      ok "captive portal 操作完了"; }
+  fi
+
+  ask "[1] DNSキャッシュを消す ${DIM}(sudo)${RST}" Y && {
+    if sudo -n true 2>/dev/null || sudo true; then
+      sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder 2>/dev/null
+      ok "DNSキャッシュを消しました"
+    else warn "sudo 認証できず — スキップ"; fi; }
+
+  [ -n "${DEFIF:-}" ] && ask "[2] DHCPリースを取り直す" Y && {
+    if sudo -n true 2>/dev/null || sudo true; then
+      sudo ipconfig set "$DEFIF" BOOTP 2>/dev/null; sleep 1
+      sudo ipconfig set "$DEFIF" DHCP 2>/dev/null; sleep 3
+      NEWIP=$(ipconfig getifaddr "$DEFIF" 2>/dev/null)
+      [ -n "$NEWIP" ] && ok "新しいIP: $NEWIP" || warn "IP取得待ち"
+    else warn "sudo 認証できず — スキップ"; fi; }
+
+  # DNS を公開DNSに固定（ハイジャック・遅いDNSの特効薬）
+  if [ -n "$SVC" ]; then
+    ask "[3] DNSを 1.1.1.1 / 8.8.8.8 に固定する ${DIM}（元に戻せます）${RST}" N && {
+      mkdir -p "$CONF_DIR"
+      networksetup -getdnsservers "$SVC" >"$DNS_BACKUP" 2>/dev/null
+      networksetup -setdnsservers "$SVC" 1.1.1.1 8.8.8.8 \
+        && ok "DNSを固定しました  ${DIM}戻す: netdoc --restore-dns${RST}"
+      sudo dscacheutil -flushcache 2>/dev/null; }
+  fi
+
+  if [ -n "$TS_BIN" ]; then
+    if [ "$(getf tailscale_state)" = Running ]; then
+      [ -n "$(getf exit_node)" ] && ask "[4] Tailscale の exit node を外す" Y && {
+        "$TS_BIN" set --exit-node= && ok "exit node を解除"; }
+      ask "[5] Tailscale を切る ${DIM}（VPNを嫌うゲスト網で）${RST}" N && {
+        "$TS_BIN" down && ok "Tailscale down  ${DIM}戻す: tailscale up${RST}"; }
+    else
+      ask "[5] Tailscale を繋ぐ" N && { "$TS_BIN" up && ok "Tailscale up"; }
+    fi
+  fi
+
+  # プロキシ環境変数を外して1回だけ試す（設定は壊さない）
+  [ -n "$(getf proxy_env)" ] && ask "[6] プロキシ環境変数を外して疎通を試す" Y && {
+    C=$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+        curl -s -o /dev/null -w '%{http_code}' --max-time 8 https://api.anthropic.com/ 2>/dev/null)
+    if echo "$C" | grep -qE '^[2-4]'; then
+      ok "プロキシを外したら通った (HTTP $C)"
+      note "原因はプロキシ設定です。シェルの設定から proxy 変数を消してください"
+    else info "プロキシを外しても変わらず (HTTP $C)"; fi; }
+
+  MTU_REAL=$(getf mtu_real); MTU_IF=$(getf mtu_if)
+  [ -n "$MTU_REAL" ] && [ -n "${DEFIF:-}" ] && [ "$MTU_REAL" -lt "${MTU_IF:-1500}" ] 2>/dev/null \
+    && ask "[7] MTU を実測値 $MTU_REAL に下げる" Y && {
+      sudo ifconfig "$DEFIF" mtu "$MTU_REAL" \
+        && ok "MTU=$MTU_REAL  ${DIM}戻す: sudo ifconfig $DEFIF mtu ${MTU_IF}${RST}"; }
+
+  SKEW=$(getf clock_skew)
+  [ -n "$SKEW" ] && [ "$SKEW" -gt 120 ] 2>/dev/null && ask "[8] 時計を合わせる ${DIM}(sudo)${RST}" Y && {
+    sudo sntp -sS time.apple.com >/dev/null 2>&1 && ok "時刻を同期しました"; }
+
+  [ -n "$SVC" ] && ask "[9] IPv6 を切る ${DIM}（IPv6が壊れている網で効く）${RST}" N && {
+    networksetup -setv6off "$SVC" && ok "IPv6 off  ${DIM}戻す: networksetup -setv6automatic '$SVC'${RST}"; }
+
+  WIFIIF=$(networksetup -listallhardwareports 2>/dev/null | awk '/Hardware Port: Wi-Fi/{getline; print $2}')
+  [ -n "${WIFIIF:-}" ] && ask "[10] Wi-Fi を切って入れ直す" N && {
+    networksetup -setairportpower "$WIFIIF" off; sleep 3
+    networksetup -setairportpower "$WIFIIF" on;  sleep 5
+    ok "Wi-Fi 再起動（IP: $(ipconfig getifaddr "$WIFIIF" 2>/dev/null || echo 取得中)）"; }
+}
+
+section_retest() {
+  step "6. 修復後の再テスト"
+  sleep 2
+  R=0
+  for u in https://api.anthropic.com/ ; do
+    C=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$u" 2>/dev/null)
+    if echo "$C" | grep -qE '^[2-4]'; then ok "$u  (HTTP $C)"; else ng "$u  まだ届かない"; R=1; fi
+  done
+  hr
+  if [ $R -eq 0 ]; then
+    printf "${GRN}${BLD}✓ 復活しました。${RST}\n"; return 0
+  fi
+  printf "${RED}${BLD}✗ まだ繋がりません。${RST}\n\n"
+  info "次に試すこと（効く順）:"
+  info "  1. iPhone のテザリングに切り替える — 網が原因かを2分で確定できる"
+  info "  2. netdoc --llm で、どの段で死んでいるかを見る"
+  info "  3. TLS が「傍受?」なら企業の中間装置。その網では原理的に通らない"
+  info "  4. env | grep -i proxy を確認"
+  return 1
+}
+
+# ─── 出力（機械可読・レポート）────────────────────────────
+emit_json() {
+  {
+    printf '{\n'
+    printf '  "netdoc": "%s",\n' "$VERSION"
+    printf '  "facts": {\n'
+    awk -F'\t' '{gsub(/"/,"\\\"",$2); printf "    \"%s\": \"%s\"%s\n", $1, $2, (NR==1?"":"")}' "$FACTS" \
+      | sed '$!s/$/,/'
+    printf '  },\n'
+    printf '  "findings": [\n'
+    if [ -s "$FIND" ]; then
+      awk -F'\t' '{gsub(/"/,"\\\"",$2); gsub(/"/,"\\\"",$3);
+        printf "    {\"severity\":\"%s\",\"title\":\"%s\",\"fix\":\"%s\"}\n", $1,$2,$3}' "$FIND" \
+        | sed '$!s/$/,/'
+    fi
+    printf '  ]\n}\n'
+  } >&3
+}
+
+emit_report() {
+  {
+    echo "# netdoc レポート"
+    echo
+    echo "- 取得: $NOW"
+    echo "- ホスト: $(hostname)"
+    echo
+    echo "## いまどこに居るか"
+    echo
+    echo '| 項目 | 値 |'
+    echo '|---|---|'
+    for k in default_if gateway interfaces wifi_ssid wifi_signal wifi_rate dns global_ip loc colo tailscale_state tailscale_ip proxy_env clock_skew; do
+      v=$(getf "$k"); [ -n "$v" ] && echo "| $k | \`$v\` |"
+    done
+    echo
+    echo "## 回線の質"
+    echo
+    echo '| 項目 | 値 |'
+    echo '|---|---|'
+    for k in rtt jitter loss dns_ms mtu_if mtu_real down_mbps up_mbps; do
+      v=$(getf "$k"); [ -n "$v" ] && echo "| $k | \`$v\` |"
+    done
+    echo
+    echo "## LLM への疎通"
+    echo
+    echo '| 宛先 | DNS | TCP | TLS | HTTP | 備考 |'
+    echo '|---|---|---|---|---|---|'
+    awk -F'\t' '$1 ~ /^target_/ {
+      n=substr($1,8); split($2,p,"|");
+      printf "| %s | %s | %s | %s | %s | %s |\n", n,p[1],p[2],p[3],p[4],p[5] }' "$FACTS"
+    echo
+    if [ -s "$FIND" ]; then
+      echo "## 所見"
+      echo
+      while IFS=$'\t' read -r sev title fix; do
+        m="⚠️"; [ "$sev" = critical ] && m="🔴"
+        echo "- $m **$title**"
+        echo "  - → $fix"
+      done <"$FIND"
+    else
+      echo "## 所見"; echo; echo "問題なし。"
+    fi
+  } >"$REPORT_PATH"
+}
+
+restore_dns() {
+  SVC=$(networksetup -listnetworkserviceorder 2>/dev/null \
+        | awk -v d="Device: $(route -n get default 2>/dev/null | awk '/interface:/{print $2}'))" \
+          'index($0,d){print prev} {if($0 ~ /^\([0-9]/) prev=substr($0,index($0,") ")+2)}' | head -1)
+  [ -z "$SVC" ] && { echo "ネットワークサービスを特定できません"; exit 1; }
+  if [ -f "$DNS_BACKUP" ] && ! grep -qi "There aren't any" "$DNS_BACKUP"; then
+    networksetup -setdnsservers "$SVC" $(cat "$DNS_BACKUP") && echo "DNSを元に戻しました: $(cat "$DNS_BACKUP")"
+  else
+    networksetup -setdnsservers "$SVC" empty && echo "DNSをDHCP任せに戻しました"
+  fi
+  sudo dscacheutil -flushcache 2>/dev/null
+}
+
+# ─── 本体 ────────────────────────────────────────────────
+header() {
+  [ "$MODE" = json ] && return
+  clear 2>/dev/null || true
+  printf "${BLD}🩺 netdoc${RST} ${DIM}v%s — ネットワーク診断＆修復${RST}\n" "$VERSION"
+  printf "${DIM}%s  mode=%s${RST}\n" "$NOW" "$MODE"
+  hr
+}
+
+discover() {
+  # 手元と tailnet から LLM サーバらしきものを探す。
+  # ポートは ollama / LM Studio / llama.cpp / persona-node の既定値。
+  header
+  step "LLMサーバを探す"
+  [ -f "$TARGETS" ] || seed_targets
+  FOUND="$(mktemp -t netdoc.disc)"
+
+  probe_port() { # ip port kind label
+    local ip="$1" port="$2" kind="$3" label="$4" url="http://$1:$2" n=""
+    nc -z -G 1 -w 1 "$ip" "$port" >/dev/null 2>&1 || return 1
+    case "$kind" in
+      ollama) n=$(curl -s --max-time 4 "$url/api/tags" 2>/dev/null | grep -o '"name"' | wc -l | tr -d ' ') ;;
+      openai) n=$(curl -s --max-time 4 "$url/v1/models" 2>/dev/null | grep -o '"id"' | wc -l | tr -d ' ') ;;
+    esac
+    [ "${n:-0}" -eq 0 ] && return 1
+    printf '%s\t%s\t%s\t%s\n' "$label" "$url" "$kind" "$n" >>"$FOUND"
+    ok "$(printf '%-26s %-30s モデル%s本' "$label" "$url" "$n")"
+    return 0
+  }
+
+  info "手元を見ています…"
+  for spec in "11434 ollama ollama" "1234 openai LMStudio" "8080 openai llama.cpp" "8787 openai persona-node"; do
+    set -- $spec
+    probe_port 127.0.0.1 "$1" "$2" "$3 (ローカル)"
+  done
+
+  if [ -n "$TS_BIN" ]; then
+    NP=$(tailscale_peers | wc -l | tr -d ' ')
+    info "tailnet の $NP 台を見ています…（1台1秒まで）"
+    SELF=$("$TS_BIN" ip -4 2>/dev/null | head -1)
+    tailscale_peers | while IFS=$'\t' read -r ip host; do
+      [ "$ip" = "$SELF" ] && continue
+      for spec in "11434 ollama ollama" "1234 openai LMStudio" "8787 openai persona-node"; do
+        set -- $spec
+        probe_port "$ip" "$1" "$2" "$3 @$host"
+      done
+    done
+  fi
+
+  hr
+  if [ ! -s "$FOUND" ]; then
+    warn "見つかりませんでした。"
+    note "相手機の LLM が 0.0.0.0 で listen しているか確認してください"
+    note "（ollama なら OLLAMA_HOST=0.0.0.0:11434）"
+    rm -f "$FOUND"; exit 0
+  fi
+  N=$(wc -l <"$FOUND" | tr -d ' ')
+  ADDED=0
+  while IFS=$'\t' read -r label url kind n; do
+    grep -qF "$url" "$TARGETS" && continue
+    printf '%-18s | %-34s | %s\n' "$label" "$url" "$kind" >>"$TARGETS"
+    ADDED=$((ADDED+1))
+  done <"$FOUND"
+  ok "$N 件見つけ、$ADDED 件を $TARGETS に追記しました"
+  note "以後 netdoc --llm で毎回まとめて疎通を見ます"
+  rm -f "$FOUND"
+}
+
+case "$MODE" in
+  discover)    discover; exit 0 ;;
+  restore-dns) restore_dns; exit 0 ;;
+
+  targets)
+    [ -f "$TARGETS" ] || seed_targets
+    printf "${BLD}調べに行く先${RST}  ${DIM}%s${RST}\n\n" "$TARGETS"
+    cat "$TARGETS"
+    printf "\n${DIM}このファイルを編集すれば、自分のLLMサーバも面倒を見ます。${RST}\n"
+    exit 0 ;;
+
+  where)  header; section_where; exit 0 ;;
+  speed)  header; section_where >/dev/null; section_quality; exit 0 ;;
+  llm)    header; section_where >/dev/null; section_llm; section_verdict; exit $? ;;
+
+  json)
+    section_where; section_quality; section_llm; section_verdict
+    emit_json; exit 0 ;;
+
+  report)
+    header; section_where; section_quality; section_llm; section_verdict
+    emit_report
+    hr; printf "${GRN}レポート: %s${RST}\n" "$REPORT_PATH"; exit 0 ;;
+
+  watch)
+    printf "${BLD}🩺 netdoc --watch${RST} ${DIM}%s秒ごと。変化したときだけ出します。Ctrl-C で終了${RST}\n" "$WATCH_SEC"
+    LAST=""
+    while :; do
+      : >"$FACTS"; : >"$FIND"
+      section_where >/dev/null 2>&1
+      section_llm   >/dev/null 2>&1
+      SIG="$(getf global_ip)|$(getf llm_bad)|$(getf captive)|$(getf wifi_ssid)"
+      if [ "$SIG" != "$LAST" ]; then
+        printf "\n${DIM}%s${RST}  " "$(date '+%H:%M:%S')"
+        if [ "$(getf llm_bad)" = "0" ] && [ "$(getf captive)" = "no" ]; then
+          printf "${GRN}正常${RST}  ip=%s %s\n" "$(getf global_ip)" "$(getf wifi_ssid)"
+        else
+          printf "${RED}異常${RST}  失敗%s件  ip=%s %s\n" "$(getf llm_bad)" "$(getf global_ip)" "$(getf wifi_ssid)"
+          awk -F'\t' '{printf "           → %s\n", $2}' "$FIND"
+        fi
+        LAST="$SIG"
+      fi
+      sleep "$WATCH_SEC"
+    done ;;
+esac
+
+header
+section_where
+section_quality
+section_llm
+if section_verdict; then exit 0; fi
+[ "$MODE" = check ] && { hr; info "(--check なので修復はしません)"; exit 1; }
+section_repair
+section_retest
+exit $?

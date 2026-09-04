@@ -11,6 +11,9 @@
 #   netdoc --auto          安全な修復を自動で実行
 #   netdoc --llm           LLM への疎通だけを段階で調べる
 #   netdoc --speed         回線速度・遅延・MTU だけ測る
+#   netdoc --full          速度測定まで含めて全部（既定は速いように省く）
+#   netdoc --stream        LLMのストリーミング初動を実測（モデルを起こします）
+#   netdoc --history       この網での過去の記録と比較
 #   netdoc --where         いまどこに居るか（IP・ISP・Wi-Fi・経路）だけ
 #   netdoc --json          全結果を JSON で出す（機械可読）
 #   netdoc --report [PATH] Markdown レポートを書き出す
@@ -23,7 +26,7 @@
 
 set -uo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 MODE="interactive"
 REPORT_PATH=""
 WATCH_SEC=60
@@ -33,6 +36,9 @@ case "${1:-}" in
   --check)   MODE="check" ;;
   --llm)     MODE="llm" ;;
   --speed)   MODE="speed" ;;
+  --full)    MODE="full" ;;
+  --stream)  MODE="stream" ;;
+  --history) MODE="history" ;;
   --where)   MODE="where" ;;
   --json)    MODE="json" ;;
   --targets) MODE="targets" ;;
@@ -41,7 +47,7 @@ case "${1:-}" in
   --restore-dns) MODE="restore-dns" ;;
   --discover)    MODE="discover" ;;
   -v|--version) echo "netdoc $VERSION"; exit 0 ;;
-  -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   "") ;;
   *) echo "不明なオプション: $1  （netdoc --help）" >&2; exit 2 ;;
 esac
@@ -65,7 +71,7 @@ hr()   { printf "${DIM}───────────────────
 ask() {
   local q="$1" def="${2:-N}" ans
   [ "$MODE" = "auto" ] && { [ "$def" = "Y" ]; return $?; }
-  case "$MODE" in check|llm|speed|where|json|report|watch|targets) return 1 ;; esac
+  case "$MODE" in check|llm|speed|where|json|report|watch|targets|stream|history) return 1 ;; esac
   if [ "$def" = "Y" ]; then
     read -r -p "$(printf "  ${YLW}?${RST} %s ${DIM}[Y/n]${RST} " "$q")" ans
     [ -z "$ans" ] || echo "$ans" | grep -qi '^y'
@@ -81,7 +87,10 @@ FIND="$(mktemp -t netdoc.find)"     # 所見（原因の候補）
 trap 'rm -f "$FACTS" "$FIND"' EXIT
 fact()   { printf '%s\t%s\n' "$1" "$2" >>"$FACTS"; }   # key<TAB>value
 getf()   { awk -F'\t' -v k="$1" '$1==k{print $2; exit}' "$FACTS"; }
-finding(){ printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$FIND"; }  # 深刻度 タイトル 対処
+# finding <優先度> <深刻度> <タイトル> <対処>
+#   優先度は小さいほど「LLMに繋がらない」の直接原因に近い。
+#   10=通信が成立していない / 20=成立するが壊れている / 30=相手側や認証 / 40=遅い・細い
+finding(){ printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >>"$FIND"; }
 
 NOW="$(date '+%Y-%m-%d %H:%M:%S')"
 fact ts "$NOW"; fact version "$VERSION"
@@ -110,6 +119,51 @@ seed_targets() {
   } >"$TARGETS"
 }
 tailscale_ips() { :; }   # 後で本体を定義する（seed時は空でよい）
+
+HISTORY="$CONF_DIR/history.tsv"
+
+netid() {
+  # 「同じ網か」を判定する指紋。SSID か、ゲートウェイのMAC、無ければGW-IP。
+  local ssid gw mac
+  gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
+  mac=$(arp -n "$gw" 2>/dev/null | awk '{print $4}' | head -1)
+  ssid=$(system_profiler SPAirPortDataType 2>/dev/null \
+         | sed -n '/Current Network Information/,/^$/p' \
+         | awk 'NR==2{gsub(/^ +| *:$/,""); print}')
+  printf '%s' "${ssid:-${mac:-${gw:-unknown}}}" | cksum | awk '{print $1}'
+}
+
+history_note() {
+  # 同じ網の前回の記録と比べて、変わったところだけ言う。
+  local nid="$1" prev n
+  [ -f "$HISTORY" ] || { info "この網は初めてです"; return 0; }
+  prev=$(awk -F'\t' -v k="$nid" '$2==k{line=$0} END{print line}' "$HISTORY")
+  n=$(awk -F'\t' -v k="$nid" '$2==k{c++} END{print c+0}' "$HISTORY")
+  [ -z "$prev" ] && { info "この網は初めてです"; return 0; }
+  info "この網は ${n}回目 ${DIM}（前回 $(echo "$prev" | cut -f1)）${RST}"
+  local p_rtt p_dns p_down p_bad
+  p_rtt=$(echo "$prev" | cut -f4); p_dns=$(echo "$prev" | cut -f5)
+  p_down=$(echo "$prev" | cut -f6); p_bad=$(echo "$prev" | cut -f8)
+  fact prev_rtt "$p_rtt"; fact prev_dns "$p_dns"; fact prev_down "$p_down"; fact prev_bad "$p_bad"
+}
+
+history_save() {
+  mkdir -p "$CONF_DIR"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$NOW" "$(getf netid)" "$(getf wifi_ssid)" "$(getf rtt)" "$(getf dns_ms)" \
+    "$(getf down_mbps)" "$(getf up_mbps)" "$(getf llm_bad)" >>"$HISTORY"
+}
+
+delta() { # delta 今 前 単位 [小さい方が良い=1]
+  local now="$1" was="$2" unit="$3" lower="${4:-1}"
+  [ -z "$was" ] && return 0
+  echo "$now$was" | grep -q '[^0-9.]' && return 0
+  awk -v a="$now" -v b="$was" -v u="$unit" -v L="$lower" 'BEGIN{
+    if(b==0) exit; d=(a-b)/b*100; if(d<0)d=-d;
+    if(d<20) exit;
+    worse = (L==1) ? (a>b) : (a<b);
+    printf "（前回 %s%s %s）", b, u, (worse ? "から悪化" : "から改善")}'
+}
 
 # ─── 小道具 ──────────────────────────────────────────────
 TS_BIN=""
@@ -160,7 +214,7 @@ section_where() {
     ok "経路          : ${BLD}$DEFIF${RST} → gw $DEFGW"
   else
     ng "デフォルトルートが無い — ケーブル/Wi-Fi の物理接続から"
-    finding critical "デフォルトルートが無い" "ケーブルを挿し直すか Wi-Fi に接続する"
+    finding 10 critical "デフォルトルートが無い" "ケーブルを挿し直すか Wi-Fi に接続する"
   fi
 
   # 生きているインターフェースを全部
@@ -179,8 +233,13 @@ section_where() {
   note "* が現在の経路"
 
   # Wi-Fi の質（電波が細いと LLM のストリーミングが途切れる）
-  WIFI=$(system_profiler SPAirPortDataType 2>/dev/null \
-         | sed -n '/Current Network Information/,/^$/p')
+  # ★system_profiler は数秒かかるので、Wi-Fi で繋がっている時だけ呼ぶ。
+  WIFIDEV=$(networksetup -listallhardwareports 2>/dev/null | awk '/Hardware Port: Wi-Fi/{getline; print $2}')
+  WIFI=""
+  if [ -n "$WIFIDEV" ] && [ "$WIFIDEV" = "${DEFIF:-}" ]; then
+    WIFI=$(system_profiler SPAirPortDataType 2>/dev/null \
+           | sed -n '/Current Network Information/,/^$/p')
+  fi
   if [ -n "$WIFI" ]; then
     SSID=$(echo "$WIFI" | awk 'NR==2{gsub(/^ +| *:$/,""); print}')
     SIG=$(echo "$WIFI"  | awk -F': ' '/Signal \/ Noise/{print $2}')
@@ -192,7 +251,7 @@ section_where() {
     RSSI=$(echo "$SIG" | awk '{print $1}' | tr -d '-')
     if [ -n "$RSSI" ] && [ "$RSSI" -gt 75 ] 2>/dev/null; then
       warn "電波が弱い（RSSI -${RSSI}dBm）— 途切れやすい"
-      finding warn "Wi-Fiの電波が弱い (-${RSSI}dBm)" "AP に近づくか有線/テザリングへ"
+      finding 40 warn "Wi-Fiの電波が弱い (-${RSSI}dBm)" "AP に近づくか有線/テザリングへ"
     fi
   fi
 
@@ -201,7 +260,7 @@ section_where() {
   fact dns "$DNS_LIST"
   [ -n "$DNS_LIST" ] && info "DNS           : $DNS_LIST" || {
     warn "DNS サーバが設定されていない"
-    finding critical "DNS未設定" "DHCPを更新するか DNS を 1.1.1.1 に手動設定"
+    finding 10 critical "DNS未設定" "DHCPを更新するか DNS を 1.1.1.1 に手動設定"
   }
 
   # グローバル IP と出口（Cloudflare の trace。余計な情報は送らない）
@@ -232,7 +291,7 @@ section_where() {
       ok "Tailscale     : $TS_IP  ${DIM}peers ${NPEER}（直結 $NDIRECT / 中継 ${NRELAY}）${RST}"
       if [ "$NRELAY" -gt 0 ] && [ "$NRELAY" -ge "$NDIRECT" ]; then
         warn "多くのピアが DERP 中継。tailnet 越しの転送が細くなる"
-        finding warn "Tailscaleが中継経由" "UDP 41641 が塞がれている可能性。可能なら別網へ"
+        finding 40 warn "Tailscaleが中継経由" "UDP 41641 が塞がれている可能性。可能なら別網へ"
       fi
       EXIT_NODE=$("$TS_BIN" status 2>/dev/null | awk '/exit node/{print $2}' | head -1)
       [ -n "$EXIT_NODE" ] && { info "exit node 経由: $EXIT_NODE"; fact exit_node "$EXIT_NODE"; }
@@ -240,7 +299,7 @@ section_where() {
       info "Tailscale     : ${TS_STATE:-停止}"
       if [ -f "$TARGETS" ] && grep -qE 'http://100\.[0-9]' "$TARGETS"; then
         warn "tailnet 上のLLMを見に行く設定なのに Tailscale が止まっている"
-        finding critical "Tailscaleが停止中" "tailscale up（tailnet先のLLMには到達できません）"
+        finding 10 critical "Tailscaleが停止中" "tailscale up（tailnet先のLLMには到達できません）"
       fi
     fi
   fi
@@ -251,12 +310,35 @@ section_where() {
   fact proxy_env "$PROXY_ENV"
   if [ -n "$PROXY_ENV" ]; then
     warn "プロキシ環境変数がある: ${DIM}$PROXY_ENV${RST}"
-    finding warn "proxy 環境変数が効いている" "外して再試行: env -u HTTP_PROXY -u HTTPS_PROXY ..."
+    finding 20 warn "proxy 環境変数が効いている" "外して再試行: env -u HTTP_PROXY -u HTTPS_PROXY ..."
   fi
   [ "${SYS_PROXY:-0}" -gt 0 ] 2>/dev/null && {
     warn "システム設定にプロキシが入っている（scutil --proxy）"
-    finding warn "システムプロキシ有効" "設定 > ネットワーク > 詳細 > プロキシ を確認"
+    finding 20 warn "システムプロキシ有効" "設定 > ネットワーク > 詳細 > プロキシ を確認"
   }
+
+  # IPv6。グローバルv6を持っているのに v6 が死んでいると、
+  # 接続のたびに v6 を先に試して待たされる（happy eyeballs の失速）。
+  V6ADDR=$(ifconfig "${DEFIF:-en0}" 2>/dev/null | awk '/inet6 [^f]/{print $2; exit}')
+  V6GW=$(route -n get -inet6 default 2>/dev/null | awk '/gateway:/{print $2}')
+  if [ -n "$V6ADDR" ]; then
+    if ping6 -c 2 -i 0.3 2606:4700:4700::1111 >/dev/null 2>&1; then
+      ok "IPv6          : $V6ADDR ${DIM}（到達OK）${RST}"
+      fact ipv6 ok
+    else
+      ng "IPv6          : アドレスはあるのに外へ出られない"
+      note "接続のたびに IPv6 を先に試して数秒待たされます"
+      fact ipv6 broken
+      finding 20 critical "IPv6が壊れている" "netdoc の修復メニューで IPv6 を切る（体感が一番変わります）"
+    fi
+  else
+    info "IPv6          : なし（v4のみ）"
+    fact ipv6 none
+  fi
+
+  # 網の指紋と、同じ網での前回との比較
+  NID=$(netid); fact netid "$NID"
+  history_note "$NID"
 
   # 時計のずれ（数分ずれると TLS が落ちる）
   RDATE=$(curl -sI --max-time 6 https://www.cloudflare.com/ 2>/dev/null | awk -F': ' 'tolower($1)=="date"{print $2}' | tr -d '\r')
@@ -267,7 +349,7 @@ section_where() {
       fact clock_skew "$SKEW"
       if [ "$SKEW" -gt 120 ]; then
         ng "時計が ${SKEW}秒 ずれている — TLS が失敗する原因"
-        finding critical "時計が${SKEW}秒ずれている" "sudo sntp -sS time.apple.com で合わせる"
+        finding 20 critical "時計が${SKEW}秒ずれている" "sudo sntp -sS time.apple.com で合わせる"
       else
         ok "時刻          : ずれ ${SKEW}秒"
       fi
@@ -279,11 +361,12 @@ section_where() {
 probe_mtu() {
   # 通る最大パケットを二分探索で実測する。1400 を決め打ちしない。
   local host="${1:-1.1.1.1}" lo=1200 hi=1500 mid pay
-  ping -c1 -t2 -D -s $((hi-28)) "$host" >/dev/null 2>&1 && { echo "$hi"; return; }
-  ping -c1 -t2 -D -s $((lo-28)) "$host" >/dev/null 2>&1 || { echo ""; return; }
+  local P="ping -c1 -t1 -W 600 -D"
+  $P -s $((hi-28)) "$host" >/dev/null 2>&1 && { echo "$hi"; return; }
+  $P -s $((lo-28)) "$host" >/dev/null 2>&1 || { echo ""; return; }
   while [ $((hi-lo)) -gt 4 ]; do
     mid=$(( (lo+hi)/2 )); pay=$((mid-28))
-    if ping -c1 -t2 -D -s "$pay" "$host" >/dev/null 2>&1; then lo=$mid; else hi=$mid; fi
+    if $P -s "$pay" "$host" >/dev/null 2>&1; then lo=$mid; else hi=$mid; fi
   done
   echo "$lo"
 }
@@ -294,7 +377,7 @@ section_quality() {
   # 遅延・ジッタ・ロス
   for target in "${DEFGW:-}" 1.1.1.1; do
     [ -z "$target" ] && continue
-    P=$(ping -c 6 -i 0.3 -t 4 "$target" 2>/dev/null)
+    P=$(ping -c 5 -i 0.2 -t 2 "$target" 2>/dev/null)
     LOSS=$(echo "$P" | awk -F'[,%]' '/packet loss/{gsub(/ /,"",$3); print $3+0}')
     STATS=$(echo "$P" | awk -F'[/= ]+' '/round-trip|rtt/{print $(NF-3)" "$(NF-1)}')
     AVG=$(echo "$STATS" | awk '{printf "%.1f", $1}')
@@ -302,12 +385,12 @@ section_quality() {
     label="ゲートウェイ"; [ "$target" = "1.1.1.1" ] && label="インターネット"
     if [ -z "$AVG" ] || [ "$AVG" = "0.0" ]; then
       ng "$label ($target) : 応答なし"
-      [ "$target" = "1.1.1.1" ] && finding warn "ICMPが通らない" "ゲストネットがpingを止めているだけの場合もある"
+      [ "$target" = "1.1.1.1" ] && finding 45 warn "ICMPが通らない" "ゲストネットがpingを止めているだけの場合もある"
     else
       msg="$label ($target) : ${AVG}ms  ${DIM}ジッタ ${JIT}ms / ロス ${LOSS:-0}%${RST}"
       if [ "${LOSS:-0}" -gt 5 ] 2>/dev/null; then
         warn "$msg"
-        finding warn "パケットロス ${LOSS}%" "電波かAP混雑。有線かテザリングへ"
+        finding 40 warn "パケットロス ${LOSS}%" "電波かAP混雑。有線かテザリングへ"
       else ok "$msg"; fi
     fi
     if [ "$target" = "1.1.1.1" ]; then
@@ -327,22 +410,27 @@ section_quality() {
     DNSMS=$(( (T1-T0)/1000000 )); fact dns_ms "$DNSMS"
     if [ "$DNSMS" -gt 500 ]; then
       warn "DNS解決     : ${DNSMS}ms（遅い）"
-      finding warn "DNSが遅い(${DNSMS}ms)" "DNSを1.1.1.1に固定すると改善することが多い"
+      finding 40 warn "DNSが遅い(${DNSMS}ms)" "DNSを1.1.1.1に固定すると改善することが多い"
     else ok "DNS解決     : ${DNSMS}ms"; fi
   fi
 
   # MTU の実測
   MTU_SCOPE=""
   MTU_IF=$(ifconfig "${DEFIF:-en0}" 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="mtu"){print $(i+1);exit}}')
-  MTU_REAL=$(probe_mtu 1.1.1.1)
-  # 外向き ICMP が塞がれている網は珍しくない。ゲートウェイまでで測り直す。
+  # 外向き ICMP が塞がれている網は珍しくない。無駄な待ちを避けて、
+  # 先ほどの ping 結果を見てから測る先を決める。
+  if [ "$(getf rtt)" = "n/a(ICMP遮断)" ]; then
+    MTU_REAL=""
+  else
+    MTU_REAL=$(probe_mtu 1.1.1.1)
+  fi
   [ -z "$MTU_REAL" ] && [ -n "${DEFGW:-}" ] && MTU_REAL=$(probe_mtu "$DEFGW") && MTU_SCOPE="（ゲートウェイまで）"
   fact mtu_if "$MTU_IF"; fact mtu_real "$MTU_REAL"
   if [ -n "$MTU_REAL" ]; then
     if [ "$MTU_REAL" -lt "${MTU_IF:-1500}" ] 2>/dev/null; then
       warn "MTU         : 設定 ${MTU_IF} だが 実際に通るのは ${MTU_REAL}"
       note "大きなパケットが黙って捨てられる＝HTTPSが途中で固まる典型"
-      finding critical "MTU不整合 (設定${MTU_IF} / 実測${MTU_REAL})" "sudo ifconfig ${DEFIF} mtu ${MTU_REAL}"
+      finding 20 critical "MTU不整合 (設定${MTU_IF} / 実測${MTU_REAL})" "sudo ifconfig ${DEFIF} mtu ${MTU_REAL}"
     else
       ok "MTU         : ${MTU_IF}（実測 ${MTU_REAL} まで通る${MTU_SCOPE:-}）"
     fi
@@ -351,7 +439,11 @@ section_quality() {
   fi
 
   # スループット
-  if [ "$MODE" = "speed" ] || [ "$MODE" = "interactive" ] || [ "$MODE" = "auto" ] || [ "$MODE" = "report" ] || [ "$MODE" = "json" ]; then
+  case "$MODE" in
+    speed|full|report|json) : ;;
+    *) info "速度        : 省略 ${DIM}（測るなら netdoc --speed / --full）${RST}"; return 0 ;;
+  esac
+  if true; then
     printf "  ${DIM}速度を測っています…${RST}\r"
     DL=$(curl -o /dev/null -s -w '%{speed_download}' --max-time 20 \
          'https://speed.cloudflare.com/__down?bytes=25000000' 2>/dev/null)
@@ -363,9 +455,9 @@ section_quality() {
     LINE="下り ${BLD}${DLM}${RST} Mbps / 上り ${BLD}${ULM}${RST} Mbps"
     if awk -v d="$DLM" 'BEGIN{exit !(d<5)}'; then
       warn "速度        : $LINE ${DIM}— 細い${RST}"
-      finding warn "回線が細い (下り ${DLM}Mbps)" "大きなモデルの応答が詰まる。テザリング等を検討"
+      finding 40 warn "回線が細い (下り ${DLM}Mbps)" "大きなモデルの応答が詰まる。テザリング等を検討"
     else
-      ok "速度        : $LINE"
+      ok "速度        : $LINE$(delta "$DLM" "$(getf prev_down)" Mbps 0)"
     fi
   fi
 
@@ -411,12 +503,12 @@ probe_target() {
         # 権威と違う答えが返っている＝DNSを書き換えられている疑い
         if echo "$host" | grep -qvE '\.local$'; then
           extra="${extra}DNS応答が公開DNSと不一致 "
-          finding critical "DNSが書き換えられている疑い ($host)" "DNSを1.1.1.1に固定して再試行"
+          finding 20 critical "DNSが書き換えられている疑い ($host)" "DNSを1.1.1.1に固定して再試行"
         fi
       fi
     else
       stage_dns="✗"; bad=1
-      finding critical "名前解決できない ($host)" "DNSキャッシュ消去→DHCP更新→DNSを1.1.1.1に固定"
+      finding 10 critical "名前解決できない ($host)" "DNSキャッシュ消去→DHCP更新→DNSを1.1.1.1に固定"
     fi
   fi
 
@@ -427,9 +519,9 @@ probe_target() {
     else
       stage_tcp="✗"; bad=1
       case "$host" in
-        127.0.0.1|localhost) finding critical "ローカルの $port が閉じている ($name)" "そのサーバが起動しているか確認" ;;
-        100.*) finding critical "tailnet先の $host:$port に繋がらない ($name)" "相手機の起動と listen アドレス(0.0.0.0)を確認" ;;
-        *) finding critical "$host:$port が塞がれている" "ファイアウォール/ゲストネットのポート制限。テザリングで確認" ;;
+        127.0.0.1|localhost) finding 10 critical "ローカルの $port が閉じている ($name)" "そのサーバが起動しているか確認" ;;
+        100.*) finding 10 critical "tailnet先の $host:$port に繋がらない ($name)" "相手機の起動と listen アドレス(0.0.0.0)を確認" ;;
+        *) finding 10 critical "$host:$port が塞がれている" "ファイアウォール/ゲストネットのポート制限。テザリングで確認" ;;
       esac
     fi
   fi
@@ -447,31 +539,34 @@ probe_target() {
       if ! echo "$issuer" | grep -qE "$PUBLIC_CA"; then
         stage_tls="傍受?"
         extra="${extra}証明書の発行者=${issuer} "
-        finding critical "TLSが傍受されている ($host)" \
+        finding 10 critical "TLSが傍受されている ($host)" \
           "企業/ゲスト網の中間装置。社内CAを信頼するか、テザリングに切替"
       fi
     else
       stage_tls="✗"; bad=1
-      finding critical "TLSハンドシェイク失敗 ($host)" "時計のずれ、SNIブロック、中間装置を疑う"
+      finding 10 critical "TLSハンドシェイク失敗 ($host)" "時計のずれ、SNIブロック、中間装置を疑う"
     fi
   fi
 
   # HTTP（種別ごとに「生きているか分かる場所」を叩く）
   if [ "$bad" -eq 0 ]; then
-    local w code ttot probe_url="$url"
+    local w code ttot ttfb probe_url="$url"
     case "$kind" in
       ollama) probe_url="$url/api/tags" ;;
       openai) curl -s -o /dev/null --max-time 4 "$url/healthz" 2>/dev/null \
                 && probe_url="$url/healthz" || probe_url="$url/v1/models" ;;
     esac
-    w=$(curl -s -o /dev/null --max-time 12 -w '%{http_code} %{time_total}' "$probe_url" 2>/dev/null)
-    code=$(echo "$w" | awk '{print $1}'); ttot=$(echo "$w" | awk '{print $2}')
-    stage_http="$code $(msec "$ttot")ms"
+    w=$(curl -s -o /dev/null --max-time 12 \
+        -w '%{http_code} %{time_starttransfer} %{time_total}' "$probe_url" 2>/dev/null)
+    code=$(echo "$w" | awk '{print $1}')
+    ttfb=$(echo "$w" | awk '{print $2}'); ttot=$(echo "$w" | awk '{print $3}')
+    # LLM で効くのは「最初のバイトまで」。全体時間よりこちらを見る。
+    stage_http="$code $(msec "$ttfb")ms"
     case "$code" in
       000) stage_http="✗"; bad=1
-           finding critical "HTTPが返らない ($host)" "TLSは通るのに応答が無い＝中間装置が握り潰している疑い" ;;
-      407) bad=1; finding critical "プロキシ認証を要求されている ($host)" "社内プロキシの資格情報が必要" ;;
-      5*)  finding warn "サーバ側が $code を返す ($host)" "相手側の問題。時間をおいて再試行" ;;
+           finding 10 critical "HTTPが返らない ($host)" "TLSは通るのに応答が無い＝中間装置が握り潰している疑い" ;;
+      407) bad=1; finding 10 critical "プロキシ認証を要求されている ($host)" "社内プロキシの資格情報が必要" ;;
+      5*)  finding 30 warn "サーバ側が $code を返す ($host)" "相手側の問題。時間をおいて再試行" ;;
       401) extra="${extra}要認証(サーバは生きている) " ;;
       403) extra="${extra}403(APIルートでは正常なことが多い) " ;;
       404) extra="${extra}404(APIルートでは正常) " ;;
@@ -482,11 +577,22 @@ probe_target() {
   if [ "$bad" -eq 0 ]; then
     case "$kind" in
       ollama)
-        local tags n
+        local tags n ps loaded
         tags=$(curl -s --max-time 8 "$url/api/tags" 2>/dev/null)
         n=$(echo "$tags" | grep -o '"name"' | wc -l | tr -d ' ')
         if [ "${n:-0}" -gt 0 ]; then extra="${extra}モデル${n}本 "
-        else extra="${extra}応答はするがモデル一覧が読めない "; fi ;;
+        else extra="${extra}応答はするがモデル一覧が読めない "; fi
+        # 読み込み済みが無い＝初回の応答は数秒〜数十秒かかる。
+        # 「繋がらない」の正体がこれであることは多い（実測でTTFB 6.5秒）。
+        ps=$(curl -s --max-time 6 "$url/api/ps" 2>/dev/null)
+        loaded=$(echo "$ps" | grep -o '"name"' | wc -l | tr -d ' ')
+        if [ "${loaded:-0}" -eq 0 ]; then
+          extra="${extra}${YLW}未ロード${RST} "
+          finding 30 warn "$name はモデルを読み込んでいない" \
+            "初回の応答に数秒〜数十秒かかります。常駐させるなら OLLAMA_KEEP_ALIVE=-1"
+        else
+          extra="${extra}ロード済${loaded} "
+        fi ;;
       openai)
         local m n
         m=$(curl -s --max-time 8 "$url/v1/models" 2>/dev/null)
@@ -511,26 +617,36 @@ section_llm() {
   step "3. LLM に届くか ${DIM}（DNS → TCP → TLS → HTTP のどこで死ぬか）${RST}"
   [ -f "$TARGETS" ] || seed_targets
 
-  LLM_BAD=0
+  # 並列に叩く。壊れている網ほど1件あたりのタイムアウトが効いてくるので、
+  # 直列だと「調べるのに時間がかかって余計に困る」状態になる。
+  PDIR="$(mktemp -d -t netdoc.p)"
+  i=0; ORDER=""
   while IFS='|' read -r name url kind; do
     name=$(echo "$name" | sed 's/^ *//; s/ *$//')
     url=$(echo "$url"   | sed 's/^ *//; s/ *$//')
     kind=$(echo "$kind" | sed 's/^ *//; s/ *$//')
     case "$name" in ''|\#*) continue ;; esac
     [ -z "$url" ] && continue
-    probe_target "$name" "$url" "${kind:-http}" || LLM_BAD=$((LLM_BAD+1))
+    i=$((i+1)); ORDER="$ORDER $i"
+    ( probe_target "$name" "$url" "${kind:-http}" >"$PDIR/$i" 2>/dev/null ) &
   done <"$TARGETS"
+  wait
+  for n in $ORDER; do [ -f "$PDIR/$n" ] && cat "$PDIR/$n"; done
+  rm -rf "$PDIR"
+
+  # 失敗数は記録された事実から数える（背景ジョブの終了コードは拾えないため）
+  LLM_BAD=$(awk -F'\t' '$1 ~ /^target_/ && $2 ~ /✗/ {c++} END{print c+0}' "$FACTS")
   fact llm_bad "$LLM_BAD"
 
   # captive portal
-  CAP=$(curl -sL --max-time 5 http://captive.apple.com/ 2>/dev/null | tr -d '\r\n')
+  CAP=$(curl -sL --max-time 3 http://captive.apple.com/ 2>/dev/null | tr -d '\r\n')
   if echo "$CAP" | grep -q '<TITLE>Success</TITLE>'; then
     ok "captive portal      : なし（直結）"
     fact captive no
   else
     warn "captive portal      : ログインが必要な可能性"
     fact captive yes
-    finding critical "captive portal 未通過" "ブラウザで http://captive.apple.com/ を開いてログイン"
+    finding 10 critical "captive portal 未通過" "ブラウザで http://captive.apple.com/ を開いてログイン"
   fi
 
   # 「繋がらない」の正体が認証だった、を切り分ける
@@ -538,7 +654,7 @@ section_llm() {
     warn "ANTHROPIC_API_KEY が環境変数に入っている"
     note "これがサブスクのOAuthより優先され、古い/失効した鍵だと 401 になる"
     note "回線ではなく認証の問題。外して試す: unset ANTHROPIC_API_KEY"
-    finding warn "ANTHROPIC_API_KEY が設定されている" "unset して再試行（401は回線問題ではない）"
+    finding 30 warn "ANTHROPIC_API_KEY が設定されている" "unset して再試行（401は回線問題ではない）"
   fi
   for f in "$HOME/.claude/.credentials.json" "$HOME/.config/claude/auth.env"; do
     [ -f "$f" ] && info "認証情報            : $(basename "$f") あり ${DIM}(中身は見ていない)${RST}"
@@ -555,11 +671,33 @@ section_verdict() {
   NCRIT=$(awk -F'\t' '$1=="critical"' "$FIND" | wc -l | tr -d ' ')
   NWARN=$(awk -F'\t' '$1=="warn"' "$FIND" | wc -l | tr -d ' ')
   fact critical_count "$NCRIT"; fact warn_count "$NWARN"
-  while IFS=$'\t' read -r sev title fix; do
-    if [ "$sev" = critical ]; then printf "  ${RED}●${RST} ${BLD}%s${RST}\n" "$title"
-    else printf "  ${YLW}●${RST} %s\n" "$title"; fi
-    printf "    ${DIM}→ %s${RST}\n" "$fix"
-  done <"$FIND"
+
+  # 全部を並べるより、まず1つ名指しする。並べるのはその後。
+  SORTED="$(mktemp -t netdoc.sorted)"
+  sort -n -k1,1 "$FIND" >"$SORTED"
+  TOP=$(head -1 "$SORTED"); TP=$(echo "$TOP" | cut -f1)
+
+  if [ "${TP:-99}" -le 30 ] 2>/dev/null; then
+    printf "  ${BLD}いちばんありそうな原因${RST}\n"
+    printf "    ${RED}%s${RST}\n" "$(echo "$TOP" | cut -f3)"
+    printf "    ${DIM}→ %s${RST}\n" "$(echo "$TOP" | cut -f4)"
+    fact top_cause "$(echo "$TOP" | cut -f3)"
+    REST=$(tail -n +2 "$SORTED"); LABEL="ほかに見えているもの"
+  else
+    # 通信そのものは成立している。原因だと断定しない。
+    printf "  ${GRN}通信を妨げている決定的な問題は見つかりませんでした。${RST}\n"
+    REST=$(cat "$SORTED"); LABEL="気になる点"
+  fi
+
+  if [ -n "$REST" ]; then
+    printf "\n  ${DIM}%s${RST}\n" "$LABEL"
+    echo "$REST" | while IFS=$'\t' read -r prio sev title fix; do
+      m="${YLW}●${RST}"; [ "$sev" = critical ] && m="${RED}●${RST}"
+      printf "  %s %s\n" "$m" "$title"
+      printf "    ${DIM}→ %s${RST}\n" "$fix"
+    done
+  fi
+  rm -f "$SORTED"
   return 1
 }
 
@@ -716,11 +854,11 @@ emit_report() {
     if [ -s "$FIND" ]; then
       echo "## 所見"
       echo
-      while IFS=$'\t' read -r sev title fix; do
+      sort -n -k1,1 "$FIND" | while IFS=$'\t' read -r prio sev title fix; do
         m="⚠️"; [ "$sev" = critical ] && m="🔴"
         echo "- $m **$title**"
         echo "  - → $fix"
-      done <"$FIND"
+      done
     else
       echo "## 所見"; echo; echo "問題なし。"
     fi
@@ -747,6 +885,55 @@ header() {
   printf "${BLD}🩺 netdoc${RST} ${DIM}v%s — ネットワーク診断＆修復${RST}\n" "$VERSION"
   printf "${DIM}%s  mode=%s${RST}\n" "$NOW" "$MODE"
   hr
+}
+
+section_stream() {
+  # 実際に1トークン生成させて「最初の1文字が返るまで」を測る。
+  # LLMで体感を決めるのはここ。★モデルを起こすので明示指定のときだけ実行する。
+  step "ストリーミングの初動 ${DIM}（実際に生成させます）${RST}"
+  [ -f "$TARGETS" ] || seed_targets
+  local any=0
+  while IFS='|' read -r name url kind; do
+    name=$(echo "$name" | sed 's/^ *//; s/ *$//')
+    url=$(echo "$url"   | sed 's/^ *//; s/ *$//')
+    kind=$(echo "$kind" | sed 's/^ *//; s/ *$//')
+    case "$name" in ''|\#*) continue ;; esac
+    [ "$kind" = ollama ] || continue
+    any=1
+    local model w ttfb tot loaded
+    loaded=$(curl -s --max-time 6 "$url/api/ps" 2>/dev/null \
+             | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    model="$loaded"
+    [ -z "$model" ] && model=$(curl -s --max-time 6 "$url/api/tags" 2>/dev/null \
+             | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    [ -z "$model" ] && { warn "$name : モデルが見つかりません"; continue; }
+    w=$(curl -s -o /dev/null --max-time 120 -w '%{time_starttransfer} %{time_total}' \
+        -H 'content-type: application/json' \
+        -d "{\"model\":\"$model\",\"prompt\":\"a\",\"stream\":true,\"options\":{\"num_predict\":1}}" \
+        "$url/api/generate" 2>/dev/null)
+    ttfb=$(echo "$w" | awk '{printf "%.2f", $1}'); tot=$(echo "$w" | awk '{printf "%.2f", $2}')
+    if awk -v t="$ttfb" 'BEGIN{exit !(t>3)}'; then
+      warn "$name : 初トークンまで ${BLD}${ttfb}秒${RST}  ${DIM}$model ${loaded:+(ロード済)}${RST}"
+      note "冷えた状態からの読み込み。常駐させるなら OLLAMA_KEEP_ALIVE=-1"
+      finding 30 warn "$name の初トークンが ${ttfb}秒" "OLLAMA_KEEP_ALIVE=-1 で常駐させる"
+    else
+      ok "$name : 初トークンまで ${BLD}${ttfb}秒${RST}  ${DIM}$model${RST}"
+    fi
+    fact "ttft_$name" "$ttfb"
+  done <"$TARGETS"
+  [ "$any" -eq 0 ] && info "ollama 種別の宛先がありません（netdoc --discover で探せます）"
+}
+
+show_history() {
+  header
+  step "この網での記録"
+  [ -f "$HISTORY" ] || { info "まだ記録がありません"; exit 0; }
+  NID=$(netid)
+  printf "  ${DIM}%-19s %-10s %8s %7s %9s %6s${RST}\n" 日時 網 遅延ms DNSms 下りMbps 失敗
+  awk -F'\t' -v k="$NID" '$2==k' "$HISTORY" | tail -20 \
+    | awk -F'\t' '{printf "  %-19s %-10s %8s %7s %9s %6s\n", $1, ($3==""?"(有線)":$3), $4, $5, $6, $8}'
+  echo
+  info "全部の網を見るには: cat $HISTORY"
 }
 
 discover() {
@@ -809,6 +996,8 @@ discover() {
 }
 
 case "$MODE" in
+  history)     show_history; exit 0 ;;
+  stream)      header; section_where >/dev/null; section_stream; section_verdict; exit $? ;;
   discover)    discover; exit 0 ;;
   restore-dns) restore_dns; exit 0 ;;
 
@@ -824,11 +1013,11 @@ case "$MODE" in
   llm)    header; section_where >/dev/null; section_llm; section_verdict; exit $? ;;
 
   json)
-    section_where; section_quality; section_llm; section_verdict
+    section_where; section_quality; section_llm; history_save; section_verdict
     emit_json; exit 0 ;;
 
   report)
-    header; section_where; section_quality; section_llm; section_verdict
+    header; section_where; section_quality; section_llm; history_save; section_verdict
     emit_report
     hr; printf "${GRN}レポート: %s${RST}\n" "$REPORT_PATH"; exit 0 ;;
 
@@ -846,7 +1035,7 @@ case "$MODE" in
           printf "${GRN}正常${RST}  ip=%s %s\n" "$(getf global_ip)" "$(getf wifi_ssid)"
         else
           printf "${RED}異常${RST}  失敗%s件  ip=%s %s\n" "$(getf llm_bad)" "$(getf global_ip)" "$(getf wifi_ssid)"
-          awk -F'\t' '{printf "           → %s\n", $2}' "$FIND"
+          sort -n -k1,1 "$FIND" | awk -F'\t' '{printf "           → %s\n", $3}'
         fi
         LAST="$SIG"
       fi
@@ -858,7 +1047,11 @@ header
 section_where
 section_quality
 section_llm
-if section_verdict; then exit 0; fi
+history_save
+if section_verdict; then
+  [ "$MODE" = full ] && { hr; info "速度も測るなら netdoc --speed / 初動は netdoc --stream"; }
+  exit 0
+fi
 [ "$MODE" = check ] && { hr; info "(--check なので修復はしません)"; exit 1; }
 section_repair
 section_retest
