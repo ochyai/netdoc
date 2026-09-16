@@ -8,7 +8,7 @@
 # 使い方:
 #   netdoc                 対話モード（診断 → 修復メニュー）
 #   netdoc --check         診断のみ。何もいじらない
-#   netdoc --fix           速度診断 → 根拠のある修復 → 再測定・復元
+#   netdoc --fix           速度診断 → 根拠のある修復 → 手で試す修復メニュー → 再測定・復元
 #   netdoc --plan          速度診断と修復候補だけ（設定変更なし）
 #   netdoc --auto          根拠のある軽い修復を無人で実行
 #   netdoc --llm           LLM への疎通だけを段階で調べる
@@ -30,7 +30,7 @@
 
 set -uo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 MODE="interactive"
 REPORT_PATH=""
 WATCH_SEC=60
@@ -82,7 +82,7 @@ while [ -L "$NETDOC_SOURCE" ]; do
   case "$NETDOC_SOURCE" in /*) ;; *) NETDOC_SOURCE="$NETDOC_DIR/$NETDOC_SOURCE" ;; esac
 done
 NETDOC_DIR=$(cd -P "$(dirname "$NETDOC_SOURCE")" && pwd) || exit 2
-for NETDOC_LIB in core quality repair; do
+for NETDOC_LIB in core quality repair menu; do
   [ -r "$NETDOC_DIR/lib/$NETDOC_LIB.sh" ] || {
     echo "netdoc: lib/$NETDOC_LIB.sh がありません。リポジトリ全体を配置してください。" >&2; exit 2;
   }
@@ -110,11 +110,12 @@ ask() {
   [ "$MODE" = "auto" ] && return 1
   [ -t 0 ] || return 1
   case "$MODE" in check|llm|speed|where|json|report|watch|targets|stream|history|full|plan) return 1 ;; esac
+  # EOF on stdin (closed pipe, Ctrl-D) is "no", never a default yes.
   if [ "$def" = "Y" ]; then
-    read -r -p "$(printf "  ${YLW}?${RST} %s ${DIM}[Y/n]${RST} " "$q")" ans
+    read -r -p "$(printf "  ${YLW}?${RST} %s ${DIM}[Y/n]${RST} " "$q")" ans || { echo; return 1; }
     [ -z "$ans" ] || echo "$ans" | grep -qi '^y'
   else
-    read -r -p "$(printf "  ${YLW}?${RST} %s ${DIM}[y/N]${RST} " "$q")" ans
+    read -r -p "$(printf "  ${YLW}?${RST} %s ${DIM}[y/N]${RST} " "$q")" ans || { echo; return 1; }
     echo "$ans" | grep -qi '^y'
   fi
 }
@@ -662,6 +663,7 @@ section_verdict() {
 DNS_BACKUP="$CONF_DIR/dns.backup"
 
 . "$NETDOC_DIR/lib/repair.sh"
+. "$NETDOC_DIR/lib/menu.sh"
 
 # ─── 出力（機械可読・レポート）────────────────────────────
 emit_report() {
@@ -894,8 +896,13 @@ case "$MODE" in
   plan) section_repair; exit "$VERDICT_STATUS" ;;
 esac
 section_repair
+section_menu
 RETEST_STATUS=0
-section_retest || RETEST_STATUS=$?
+if [ "$MENU_ATTEMPTED" = 1 ]; then
+  section_menu_retest || RETEST_STATUS=$?
+else
+  section_retest || RETEST_STATUS=$?
+fi
 if [ "$RETEST_STATUS" = 0 ]; then
   case "$MODE" in fix|auto) performance_retest || RETEST_STATUS=$? ;; esac
 fi

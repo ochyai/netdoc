@@ -30,7 +30,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         for arg in ("--fix", "--plan", "--restore", "--pause"):
             self.assertIn(arg, r.stdout)
-        self.assertIn("0.4.0", self.run_cli("--version").stdout)
+        self.assertIn("0.5.0", self.run_cli("--version").stdout)
 
     def test_invalid_arguments_fail_before_probes(self):
         for args in (("--check", "unexpected"), ("--watch", "0"),
