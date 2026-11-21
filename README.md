@@ -1,5 +1,14 @@
 # netdoc 🩺
 
+<!-- about -->
+> **このリポは何か**：Macの通信が遅い原因をWi-Fi・DNS・外部回線などに切り分け、修復後の通信を測り直す。
+>
+> **What this is**: This Mac tool diagnoses slow connections across Wi-Fi, DNS, and upstream networks, then retests the connection after repairs.
+>
+> **まず開く / Start here**：`netdoc --plan`
+<!-- /about -->
+
+
 **Web・動画・ダウンロードが遅い原因を調べ、直せる箇所を修復して測り直す** macOS 用ネットワークドクター。
 
 Wi-Fi、ルーターまでの通信、外部回線、DNS、VPN、通信中のアプリを切り分けます。
